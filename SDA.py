@@ -55,10 +55,10 @@ class SDA:
         using Cardono method
 
         Args:
-            a, b, c, d: Tensor with shape ()
+            a, b, c, d: Scalars representing the coefficients of cubic equation.
 
         Returns:
-            real roots
+            Tensor containing the real roots of the cubic equation.
         """
         # Calculate the intermediate values for the cubic equation
         p = (3*a*c - b**2) / (3*a**2)
@@ -262,7 +262,7 @@ class SDA:
             # make sure the there are at least 3 iterations and at most max_iter iterations
             return tf.logical_and(k < self.max_iter, tf.logical_or(k < 3, self.stopping_criterion(X, X_prev, X_prev_prev, Rk)))
 
-
+        @tf.function
         def body(X, Y, E, F, X_prev, X_prev_prev, k):
             X_prev_prev = X_prev
             X_prev = X
@@ -328,7 +328,7 @@ class SDA:
             # make sure the there are at least 3 iterations and at most max_iter iterations
             return tf.logical_and(k < self.max_iter, tf.logical_or(k < 3, self.stopping_criterion(X, X_prev, X_prev_prev, Rk)))
 
-
+        @tf.function
         def body(X, Y, E, F, X_prev, X_prev_prev, k):
             X_prev_prev = X_prev
             X_prev = X
