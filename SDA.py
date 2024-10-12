@@ -1,4 +1,65 @@
-    def solve(self, A, B, C, P0=None):
+    @staticmethod
+    def solve_cubic(a, b, c, d):
+        p = (3*a*c - b**2) / (3*a**2)
+        q = (2*b**3 - 9*a*b*c + 27*a**2*d) / (27*a**3)
+        delta = (q**2 / 4 + p**3 / 27)
+
+        def compute_one_real_root():
+            u = tf.pow(-q/2 + tf.sqrt(delta), 1/3)
+            v = tf.pow(-q/2 - tf.sqrt(delta), 1/3)
+            x1 = u + v - b / (3*a)
+            return tf.stack([x1])
+
+        def compute_three_real_roots():
+            phi = tf.acos(-q / (2 * tf.sqrt(-(p**3) / 27)))
+            root1 = 2 * tf.sqrt(-p / 3) * tf.cos(phi / 3) - b / (3*a)
+            root2 = 2 * tf.sqrt(-p / 3) * tf.cos((phi + 2 * 3.141592653589793) / 3) - b / (3*a)
+            root3 = 2 * tf.sqrt(-p / 3) * tf.cos((phi + 4 * 3.141592653589793) / 3) - b / (3*a)
+            return tf.stack([root1, root2, root3])
+
+        def compute_double_root():
+            u = tf.pow(-q/2, 1/3)
+            x1 = 2*u - b / (3*a)
+            x2 = -u - b / (3*a)
+            return tf.stack([x1, x2])
+
+        roots = tf.cond(delta > 0, compute_one_real_root, 
+                        lambda: tf.cond(delta < 0, compute_three_real_roots, compute_double_root))
+        return roots
+
+    def optimize(self):
+        def process_batch(batch):
+            A, B, C = batch
+            n = tf.shape(A)[0]
+
+            def compute_pj(j):
+                a_j = A[:, j]
+                b_j = B[:, j]
+                c_j = C[:, j]
+
+                a_bar = tf.reduce_sum(tf.square(a_j))
+                b_bar = 2 * tf.reduce_sum(a_j * b_j)
+                c_bar = tf.reduce_sum(tf.square(b_j)) + 2 * tf.reduce_sum(a_j * c_j)
+                d_bar = 2 * tf.reduce_sum(b_j * c_j)
+                e_bar = tf.reduce_sum(tf.square(c_j))
+
+                def objective(p_j):
+                    return a_bar * p_j**4 + b_bar * p_j**3 + c_bar * p_j**2 + d_bar * p_j + e_bar
+
+                roots = self.solve_cubic(4*a_bar, 3*b_bar, 2*c_bar, d_bar)
+
+                candidates = tf.concat([roots, [-self.rho, self.rho]], axis=0)
+                values = tf.map_fn(objective, candidates)
+                min_index = tf.argmin(values)
+                return candidates[min_index]
+
+            p_j_star = tf.map_fn(compute_pj, tf.range(n), dtype=tf.float32)
+            return tf.linalg.diag(p_j_star)
+
+        P_0 = tf.map_fn(process_batch, (self.A, self.B, self.C), dtype=tf.float32)
+        return P_0
+        
+def solve(self, A, B, C, P0=None):
         """
         Solve the quadratic matrix equation using the selected SDA algorithm.
 
