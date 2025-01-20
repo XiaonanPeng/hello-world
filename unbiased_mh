@@ -1,0 +1,155 @@
+import tensorflow as tf
+import tensorflow_probability as tfp
+
+# Aliases for readability
+tfd = tfp.distributions
+tfb = tfp.bijectors
+
+# Helper function for maximal coupling
+def maximal_coupling(proposal_dist_x, proposal_dist_y, seed=None):
+    """
+    Implements maximal coupling of two proposal distributions Q(x, ·) and Q(y, ·).
+
+    Args:
+        proposal_dist_x: TFP distribution object for Q(x, ·).
+        proposal_dist_y: TFP distribution object for Q(y, ·).
+        seed: Random seed for reproducibility.
+
+    Returns:
+        A tuple of (x_prime, y_prime) sampled from the maximal coupling.
+    """
+    # Sample x' from Q(x, ·)
+    x_prime = proposal_dist_x.sample(seed=seed)
+    u = tf.random.uniform(shape=[], seed=seed)
+
+    # Compute densities q(x'|x) and q(x'|y)
+    q_x = proposal_dist_x.prob(x_prime)
+    q_y = proposal_dist_y.prob(x_prime)
+
+    # Decide whether to set y' = x' based on maximal coupling condition
+    if u * q_x <= q_y:
+        y_prime = x_prime
+    else:
+        # If not, sample y' independently from Q(y, ·)
+        y_prime = proposal_dist_y.sample(seed=seed)
+
+    return x_prime, y_prime
+
+
+# Helper function for maximal reflection coupling
+def maximal_reflection_coupling(proposal_dist_x, proposal_dist_y, x, y, seed=None):
+    """
+    Implements maximal reflection coupling for spherically symmetric proposals.
+
+    Args:
+        proposal_dist_x: TFP distribution object for Q(x, ·).
+        proposal_dist_y: TFP distribution object for Q(y, ·).
+        x: Current state of chain X.
+        y: Current state of chain Y.
+        seed: Random seed for reproducibility.
+
+    Returns:
+        A tuple of (x_prime, y_prime) sampled from the reflection-based coupling of Q(x, ·) and Q(y, ·).
+    """
+    # Sample x' from Q(x, ·)
+    x_prime = proposal_dist_x.sample(seed=seed)
+    u = tf.random.uniform(shape=[], seed=seed)
+
+    # Compute densities q(x'|x) and q(x'|y)
+    q_x = proposal_dist_x.prob(x_prime)
+    q_y = proposal_dist_y.prob(x_prime)
+
+    # Decide whether to set y' = x'
+    if u * q_x <= q_y:
+        y_prime = x_prime
+    else:
+        # Reflect x' around the midpoint of x and y
+        direction = y - x
+        direction_norm = tf.norm(direction)
+        reflection = x + (2 * direction / (direction_norm + 1e-8)) * (tf.reduce_sum((x_prime - x) * direction) / direction_norm)
+        y_prime = reflection
+
+    return x_prime, y_prime
+
+
+# Helper function for acceptance step
+def acceptance_step(target_log_prob_fn, x, x_prime, seed=None):
+    """
+    Computes the acceptance step for Metropolis-Hastings.
+
+    Args:
+        target_log_prob_fn: Callable that computes the log target density log π(x).
+        x: Current state.
+        x_prime: Proposed state.
+        seed: Random seed for reproducibility.
+
+    Returns:
+        A new state (either x_prime or x) after applying the acceptance step.
+    """
+    log_acceptance_ratio = target_log_prob_fn(x_prime) - target_log_prob_fn(x)
+    acceptance_prob = tf.math.minimum(1.0, tf.math.exp(log_acceptance_ratio))
+    u = tf.random.uniform(shape=[], seed=seed)
+
+    # Accept or reject the proposal
+    return tf.cond(u < acceptance_prob, lambda: x_prime, lambda: x)
+
+
+# Implement the P_C kernel
+def P_c_kernel(proposal_dist, target_log_prob_fn, x, y, seed=None, use_reflection=False):
+    """
+    Implements the P_C kernel for unbiased Metropolis-Hastings with maximal coupling.
+
+    Args:
+        proposal_dist: A function that returns a TFP distribution object Q(x, ·) when given x.
+        target_log_prob_fn: A callable that computes the log target density log π(x).
+        x: Current state of chain X.
+        y: Current state of chain Y.
+        seed: Random seed for reproducibility.
+        use_reflection: Whether to use maximal reflection coupling.
+
+    Returns:
+        A tuple of (x_next, y_next) representing the next states of the two chains.
+    """
+    # Get proposal distributions for x and y
+    proposal_dist_x = proposal_dist(x)
+    proposal_dist_y = proposal_dist(y)
+
+    # Draw from the maximal coupling of the proposal distributions
+    if use_reflection:
+        x_prime, y_prime = maximal_reflection_coupling(proposal_dist_x, proposal_dist_y, x, y, seed=seed)
+    else:
+        x_prime, y_prime = maximal_coupling(proposal_dist_x, proposal_dist_y, seed=seed)
+
+    # Perform acceptance step for both chains
+    x_next = acceptance_step(target_log_prob_fn, x, x_prime, seed=seed)
+    y_next = acceptance_step(target_log_prob_fn, y, y_prime, seed=seed)
+
+    return x_next, y_next
+
+
+# Example usage
+def example():
+    """
+    Example usage of the P_C kernel with a 1D Gaussian target distribution.
+    """
+    # Define target distribution: Standard normal
+    target_log_prob_fn = lambda x: tfd.Normal(0.0, 1.0).log_prob(x)
+
+    # Define proposal distribution: Normal centered at current state
+    def proposal_dist(x):
+        return tfd.Normal(loc=x, scale=1.0)
+
+    # Initial states for the two chains
+    x_init = tf.constant(0.0)
+    y_init = tf.constant(2.0)
+
+    # Simulate a few steps of the coupled chains
+    num_steps = 10
+    x, y = x_init, y_init
+    print("Simulating coupled chains...")
+    for i in range(num_steps):
+        x, y = P_c_kernel(proposal_dist, target_log_prob_fn, x, y, seed=i, use_reflection=True)
+        print(f"Step {i + 1}: X = {x.numpy()}, Y = {y.numpy()}")
+
+# Run the example
+example()
