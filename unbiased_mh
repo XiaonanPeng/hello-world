@@ -21,13 +21,13 @@ def maximal_coupling(p_dist, q_dist, sample_shape=()):
     Performs maximal coupling of two distributions using the algorithm from the notes (Algorithm 2.1).
 
     The algorithm is:
-    1. Sample X ~ p.
-    2. Sample W ~ Uniform(0, 1).
-         a. If W <= q(X)/p(X), then set Y = X.
-         b. Otherwise, sample Y* ~ q and W* ~ Uniform(0, 1).
-             i. If W* > p(Y*)/q(Y*), set Y = Y*.
-             ii. Otherwise, repeat step 2b.
-    3. Return the coupled pair (X, Y).
+      1. Sample X ~ p.
+      2. Sample W ~ Uniform(0, 1):
+           a. If W ≤ q(X)/p(X), then set Y = X.
+           b. Otherwise, sample Y* ~ q and W* ~ Uniform(0, 1).
+                i. If W* > p(Y*)/q(Y*), set Y = Y*.
+                ii. Otherwise, repeat step 2b.
+      3. Return the coupled pair (X, Y).
 
     Args:
         p_dist: A tfp.distributions.Distribution instance representing distribution p.
@@ -44,43 +44,43 @@ def maximal_coupling(p_dist, q_dist, sample_shape=()):
     q_pdf = q_dist.prob(x)
     # Draw a uniform sample for the first test.
     u = tf.random.uniform(tf.shape(p_pdf), dtype=p_pdf.dtype)
-    # Create mask where acceptance holds: u <= q(x)/p(x)
+    # Initial acceptance test: if u <= q(x)/p(x), then set y = x.
     accept_mask = tf.less_equal(u, q_pdf / p_pdf)
-    # Initialize y as x where accepted.
     y = tf.where(accept_mask, x, tf.zeros_like(x))
-    
-    # For the indices where the initial candidate is not accepted,
-    # we run a while_loop to sample from q until acceptance condition holds.
+
+    # For indices where initial candidate is not accepted, run a while_loop.
     def cond(y, mask):
-        # Continue if there is any element not accepted.
+        # Continue if there is any element not yet accepted.
         return tf.reduce_any(tf.logical_not(mask))
 
     def body(y, mask):
-        # For indices that still need a candidate, sample candidates from q.
-        # We extract only those indices.
-        sample_shape_candidate = tf.shape(tf.boolean_mask(x, tf.logical_not(mask)))
-        y_candidate = q_dist.sample(sample_shape_candidate)
+        # For the indices that are not accepted, sample candidate from q.
+        candidate = q_dist.sample(tf.shape(tf.boolean_mask(x, tf.logical_not(mask))))
         u_candidate = tf.random.uniform(tf.shape(tf.boolean_mask(p_pdf, tf.logical_not(mask))),
                                         dtype=p_pdf.dtype)
-        # Compute p(y_candidate) / q(y_candidate) for these indices.
-        p_pdf_candidate = p_dist.prob(y_candidate)
-        q_pdf_candidate = q_dist.prob(y_candidate)
-        candidate_accept = tf.greater(u_candidate, p_pdf_candidate / q_pdf_candidate)
-        # Update y and mask for accepted indices.
-        accepted_y = tf.boolean_mask(y_candidate, candidate_accept)
+        p_candidate = p_dist.prob(candidate)
+        q_candidate = q_dist.prob(candidate)
+        candidate_accept = tf.greater(u_candidate, p_candidate / q_candidate)
+        # Update y for accepted candidates.
         indices = tf.where(tf.logical_not(mask))
-        # We update the entries in y at the corresponding positions.
-        y = tf.tensor_scatter_nd_update(y, indices, accepted_y)
-        # Update the mask and return
-        new_mask = tf.logical_or(mask, tf.scatter_nd(indices, candidate_accept, tf.shape(mask)))
-        return y, new_mask
+        # candidate_accept is a boolean tensor with shape matching number of not-yet-accepted indices.
+        accepted_candidate = tf.boolean_mask(candidate, candidate_accept)
+        # Only update those indices where candidate_accept is True.
+        # To avoid shape mismatch, update if and only if at least one candidate was accepted.
+        def update_y():
+            new_y = tf.tensor_scatter_nd_update(y, tf.boolean_mask(indices, candidate_accept), accepted_candidate)
+            new_mask = tf.tensor_scatter_nd_update(mask, indices, candidate_accept)
+            return new_y, new_mask
+        def no_update():
+            return y, mask
+        y, mask = tf.cond(tf.reduce_any(candidate_accept), update_y, no_update)
+        return y, mask
 
-    # Initialize mask of accepted elements.
     accepted_mask = accept_mask
     y, accepted_mask = tf.while_loop(cond, body, (y, accepted_mask),
                                      shape_invariants=(tf.TensorShape(None), tf.TensorShape(None)))
-    # For those indices initially accepted, set y = x.
-    y = tf.where(accept_mask, x, y)
+    # For indices accepted initially, set y = x.
+    y = tf.where(accepted_mask, x, y)
     return x, y
 
 
@@ -90,56 +90,48 @@ def maximal_reflection_coupling_normal(mu1, mu2, cov, sample_shape=()):
     as described in Algorithm 2.2 in the notes.
 
     The algorithm is as follows:
-    1. Let z = Σ^(-1/2)(mu1 - mu2) and e = z / ||z||.
-    2. Sample X_dot ~ N(0, I) and W ~ Uniform(0, 1).
-         a. If W <= s(X_dot + z) / s(X_dot) (i.e. exp(-⟨X_dot, z⟩ - 0.5||z||^2)), then set Y_dot = X_dot + z.
-         b. Otherwise, set Y_dot = X_dot - 2*(<e, X_dot>)*e.
-    3. Set X = Σ^(1/2) * X_dot + mu1, Y = Σ^(1/2) * Y_dot + mu2 and return (X, Y).
+      1. Let z = L^(-1)(mu1 - mu2) and e = z / ||z||.
+      2. Sample X_dot ~ N(0, I) and U ~ Uniform(0, 1).
+           a. If U ≤ exp(-<X_dot, z> - 0.5 * ||z||^2), then set Y_dot = X_dot + z.
+           b. Otherwise, set Y_dot = X_dot - 2·(<X_dot, e>)*e.
+      3. Set X = L * X_dot + mu1, Y = L * Y_dot + mu2 and return (X, Y).
 
     Args:
-        mu1: Mean of the first Gaussian. Tensor of shape [batch, d] or [d].
-        mu2: Mean of the second Gaussian. Tensor of same shape as mu1.
+        mu1: Mean of the first Gaussian. Tensor of shape [..., d].
+        mu2: Mean of the second Gaussian. Tensor of the same shape as mu1.
         cov: Covariance matrix. Tensor of shape [d, d].
-        sample_shape: Additional sample shape (if running multiple independent copies).
+        sample_shape: Optional sample shape.
 
     Returns:
         A tuple (X, Y) which are coupled samples from N(mu1, cov) and N(mu2, cov), respectively.
     """
-    # Compute the Cholesky factor L of the covariance matrix.
+    # Compute the Cholesky factor of the covariance.
     L = tf.linalg.cholesky(cov)
-    # Compute the inverse of L.
     d = tf.shape(L)[0]
+    # Compute L^-1 using triangular solve.
     identity = tf.eye(d, dtype=L.dtype)
     L_inv = tf.linalg.triangular_solve(L, identity)
-    
-    # Reshape mu1 and mu2 if needed so that the last dimension corresponds to d.
+  
     mu1 = tf.convert_to_tensor(mu1)
     mu2 = tf.convert_to_tensor(mu2)
-    
-    # Compute z = L^(-1) * (mu1 - mu2). Supports broadcasting over batch dimensions.
+  
+    # Compute z = L^-1 (mu1 - mu2) and then e = z / ||z||.
     z = tf.linalg.matvec(L_inv, (mu1 - mu2))
-    # Compute the norm of z and then e = z / ||z|| (avoid division by zero)
     z_norm = tf.norm(z, axis=-1, keepdims=True) + 1e-10
     e = z / z_norm
 
-    # Sample X_dot from standard normal.
+    # Sample X_dot ~ N(0, I) with shape matching mu1.
     X_dot = tf.random.normal(tf.concat([tf.shape(mu1)[:-1], [d]], axis=0), dtype=mu1.dtype)
-    # Sample U ~ Uniform(0, 1) with shape [..., 1]
     U = tf.random.uniform(tf.shape(X_dot)[:-1] + [1], dtype=mu1.dtype)
-    
-    # Calculate the acceptance ratio:
-    # ratio = exp( - <X_dot, z> - 0.5 * ||z||^2 )
+    # Compute ratio = exp(-<X_dot, z> - 0.5 * ||z||^2).
     dot_Xz = tf.reduce_sum(X_dot * z, axis=-1, keepdims=True)
     ratio = tf.exp(-dot_Xz - 0.5 * tf.reduce_sum(z * z, axis=-1, keepdims=True))
-    
-    # Decide coupling: if U <= ratio, then set Y_dot = X_dot + z; otherwise reflect X_dot.
     condition = tf.less_equal(U, ratio)
-    # Compute reflected value: Y_dot = X_dot - 2 * (<X_dot, e>) * e.
+    # Compute reflected value: Y_dot = X_dot - 2·(<X_dot, e>)*e.
     dot_Xe = tf.reduce_sum(X_dot * e, axis=-1, keepdims=True)
     reflected = X_dot - 2 * dot_Xe * e
     Y_dot = tf.where(condition, X_dot + z, reflected)
-    
-    # Transform back using the Cholesky factor.
+    # Transform back.
     X = tf.linalg.matvec(L, X_dot) + mu1
     Y = tf.linalg.matvec(L, Y_dot) + mu2
     return X, Y
