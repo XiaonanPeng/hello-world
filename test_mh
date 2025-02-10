@@ -1,0 +1,130 @@
+# File: test_coupled_mh_and_unbiased_estimator_basic.py
+"""
+File: test_coupled_mh_and_unbiased_estimator_basic.py
+
+This script integrates tests for the coupled MH kernel as well as
+the unbiased MH estimator on a simple target (standard normal). The tests:
+  - Verify output shapes and basic fields of the kernel.
+  - Check that if the two chains start identically the proposals are coupled.
+  - Ensure that meeting times are recorded as iterations progress.
+  - Run the unbiased estimator (with hyperparameters k and m) on a standard normal target and check that the estimated expectation (using h(x)=x[0]) is near 0.
+"""
+
+import unittest
+import tensorflow as tf
+import numpy as np
+import tensorflow_probability as tfp
+
+from coupled_mh_kernel import CoupledMetropolisHastingsKernel
+from unbiased_mcmc_estimator import UnbiasedMCMCEstimator
+
+tfd = tfp.distributions
+
+def target_log_prob_fn_standard(x):
+    # Standard multivariate normal: N(0, I)
+    return -0.5 * tf.reduce_sum(x**2, axis=-1)
+
+def h_fn(x):
+    # Test function: first coordinate of state
+    return x[:, 0]
+
+class TestCoupledMHAndUnbiasedEstimatorBasic(unittest.TestCase):
+
+    def setUp(self):
+        tf.random.set_seed(42)
+        np.random.seed(42)
+        self.batch = 8
+        self.d = 3
+        self.proposal_var = 1.0
+        # Two different initialization schemes:
+        # (a) distinct initial states.
+        init1 = np.random.randn(self.batch, self.d).astype(np.float32)
+        init2 = np.random.randn(self.batch, self.d).astype(np.float32)
+        self.init_state_diff = (tf.convert_to_tensor(init1),
+                                tf.convert_to_tensor(init2))
+        # (b) identical initial states for coupling verification.
+        init_same = np.random.randn(self.batch, self.d).astype(np.float32)
+        self.init_state_same = (tf.convert_to_tensor(init_same),
+                                tf.convert_to_tensor(init_same))
+
+    def test_kernel_output_shapes(self):
+        # Testing output shapes and field existence of the MH kernel.
+        kernel = CoupledMetropolisHastingsKernel(
+            target_log_prob_fn=target_log_prob_fn_standard,
+            proposal_var=self.proposal_var,
+            coupling_method="maximal",
+            max_iter=5,
+            seed=123)
+        kernel_results = kernel.bootstrap_results(self.init_state_diff)
+        new_state, new_kernel_results = kernel.one_step(self.init_state_diff, kernel_results)
+        state1, state2 = new_state
+        self.assertEqual(state1.shape, (self.batch, self.d),
+                         "State1 shape does not match expected.")
+        self.assertEqual(state2.shape, (self.batch, self.d),
+                         "State2 shape does not match expected.")
+        self.assertEqual(new_kernel_results["target_log_prob"][0].shape, (self.batch,))
+        self.assertEqual(new_kernel_results["target_log_prob"][1].shape, (self.batch,))
+        self.assertEqual(new_kernel_results["meeting_time"].shape, (self.batch,))
+        self.assertIsInstance(new_kernel_results["t"], tf.Tensor)
+
+    def test_kernel_coupling_identical_initial(self):
+        # When both chains start at the same state, the coupled proposals should be nearly identical.
+        kernel = CoupledMetropolisHastingsKernel(
+            target_log_prob_fn=target_log_prob_fn_standard,
+            proposal_var=self.proposal_var,
+            coupling_method="maximal",
+            max_iter=5,
+            seed=321)
+        kernel_results = kernel.bootstrap_results(self.init_state_same)
+        new_state, _ = kernel.one_step(self.init_state_same, kernel_results)
+        state1, state2 = new_state
+        diff = tf.reduce_max(tf.abs(state1 - state2))
+        self.assertLess(diff.numpy(), 1e-5, "Chains did not remain coupled with identical initialization.")
+
+    def test_meeting_time_progress(self):
+        # Run several iterations and check that meeting times (per batch) are eventually recorded.
+        kernel = CoupledMetropolisHastingsKernel(
+            target_log_prob_fn=target_log_prob_fn_standard,
+            proposal_var=self.proposal_var,
+            coupling_method="maximal",
+            max_iter=5,
+            seed=100)
+        kernel_results = kernel.bootstrap_results(self.init_state_diff)
+        state = self.init_state_diff
+        max_iter = 15
+        meeting_times = []
+        for t in range(max_iter):
+            state, kernel_results = kernel.one_step(state, kernel_results)
+            meeting_times.append(kernel_results["meeting_time"])
+        mt_np = meeting_times[-1].numpy()
+        # At least one chain in the batch should have met (meeting time recorded as non-negative).
+        self.assertTrue(np.any(mt_np >= 0),
+                        "None of the chains recorded a meeting time after {} iterations.".format(max_iter))
+    
+    def test_unbiased_estimator_on_standard_normal(self):
+        # Run the unbiased estimator using a standard normal target.
+        k = 5
+        m = 15
+        kernel = CoupledMetropolisHastingsKernel(
+            target_log_prob_fn=target_log_prob_fn_standard,
+            proposal_var=self.proposal_var,
+            coupling_method="maximal",
+            max_iter=5,
+            seed=200)
+        estimator_obj = UnbiasedMCMCEstimator(
+            coupled_kernel=kernel,
+            h_fn=h_fn,
+            k=k,
+            m=m)
+        estimator, meeting_time = estimator_obj.run(self.init_state_diff)
+        # For the standard normal, the expectation for the first coordinate is zero.
+        avg_estimate = tf.reduce_mean(estimator).numpy()
+        self.assertAlmostEqual(avg_estimate, 0.0, delta=0.3,
+                               msg="Unbiased estimator produced an unexpected mean for standard normal target.")
+        meeting_time_np = meeting_time.numpy()
+        # For any chain that has met, the meeting time should be at least k.
+        self.assertTrue(np.all((meeting_time_np == -1) | (meeting_time_np >= k)),
+                        "Meeting times must be either -1 (not met) or >= k.")
+
+if __name__ == "__main__":
+    unittest.main()
