@@ -1,0 +1,85 @@
+# File: unbiased_mcmc_estimator.py
+"""
+File: unbiased_mcmc_estimator.py
+
+This file implements an unbiased MCMC estimator class following Algorithm 2.4
+(in your notes) using coupled MCMC. The estimator is constructed with hyperparameters
+k (burn-in) and m (average/ truncation time) and is given by:
+
+    estimator = (1/(m-k+1)) * sum_{t=k}^{m} h(X_t)
+                + sum_{t=k+1}^{m} I{t < τ} * min{1, (t-k)/(m-k+1)} * (h(X_t) - h(Y_{t-1}))
+
+where X_t and Y_t are the trajectories of the two coupled chains and τ is the meeting time.
+It is assumed that h_fn outputs a scalar per chain (i.e. shape [batch]).
+"""
+
+import tensorflow as tf
+
+class UnbiasedMCMCEstimator(object):
+    def __init__(self, coupled_kernel, h_fn, k, m):
+        """
+        Initialize the unbiased MCMC estimator.
+
+        Args:
+            coupled_kernel: A coupled MCMC kernel instance (e.g. CoupledMetropolisHastingsKernel).
+            h_fn: A function that maps a state (tensor of shape [batch, d]) to a scalar per batch (tensor of shape [batch]).
+            k: Burn-in time (integer). The estimator averages from time k to m.
+            m: Truncation time (integer), with m >= k.
+        """
+        if m < k:
+            raise ValueError("m must be greater than or equal to k.")
+        self.coupled_kernel = coupled_kernel
+        self.h_fn = h_fn
+        self.k = k
+        self.m = m
+
+    def run(self, initial_state):
+        """
+        Run the coupled MCMC chains for a fixed number of iterations (m steps)
+        and compute the unbiased estimator following Algorithm 2.4.
+
+        Args:
+            initial_state: A tuple (state1, state2), each tensor of shape [batch, d].
+        Returns:
+            estimator: A tensor of shape [batch] representing the unbiased estimates.
+            meeting_time: A tensor of shape [batch] representing the meeting time τ.
+        """
+        # Initialize kernel results and trajectories.
+        kernel_results = self.coupled_kernel.bootstrap_results(initial_state)
+        X_list = []  # Trajectory from chain 1.
+        Y_list = []  # Trajectory from chain 2.
+        # Record iteration 0.
+        X_list.append(initial_state[0])
+        Y_list.append(initial_state[1])
+        current_state = initial_state
+        # Run m iterations (so that we have m+1 states for X and m+1 states for Y).
+        for t in range(self.m):
+            new_state, kernel_results = self.coupled_kernel.one_step(current_state, kernel_results)
+            X_list.append(new_state[0])
+            Y_list.append(new_state[1])
+            current_state = new_state
+
+        # Compute h evaluations along the trajectories.
+        # h_X will be a list of m+1 tensors, each of shape [batch].
+        h_X = [self.h_fn(x) for x in X_list]
+        h_Y = [self.h_fn(y) for y in Y_list]
+
+        # First term: average from time t = k to t = m of h(X_t).
+        num_avg = self.m - self.k + 1
+        sum_hX = tf.add_n(h_X[self.k : self.m + 1])
+        term1 = sum_hX / tf.cast(num_avg, h_X[0].dtype)
+
+        # Second term: correction term.
+        correction = tf.zeros_like(term1)
+        denom = tf.cast(num_avg, h_X[0].dtype)
+        # Loop t = k+1 to m (inclusive). For each t, use h(X_t) - h(Y_{t-1}) weighted by the indicator {t < τ}.
+        for t in range(self.k + 1, self.m + 1):
+            weight = tf.minimum(1.0, tf.cast(t - self.k, h_X[0].dtype) / denom)
+            # For each batch, include the term if t is less than the meeting time τ.
+            current_t = tf.constant(t, dtype=tf.int32)
+            mask = tf.cast(tf.reshape(current_t < kernel_results["meeting_time"], [-1]), h_X[0].dtype)
+            diff = h_X[t] - h_Y[t - 1]
+            correction += weight * mask * diff
+
+        estimator = term1 + correction
+        return estimator, kernel_results["meeting_time"]
