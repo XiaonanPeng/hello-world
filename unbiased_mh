@@ -1,715 +1,171 @@
-# File: coupling_algorithms.py
+# File: coupled_mh_kernel.py
 """
-This module provides coupling algorithms in accordance with the notes.
+File: coupled_mh_kernel.py
 
-Functions:
-    maximal_coupling(p_dist, q_dist, sample_shape=()):
-        Performs maximal coupling for continuous distributions (Algorithm 2.1).
+This file implements a coupled Metropolis-Hastings (MH) kernel for unbiased MCMC,
+integrating deeply with TensorFlow Probability (TFP) by inheriting from
+tfp.mcmc.TransitionKernel. It supports Gaussian proposals and two coupling algorithms:
+"maximal" and "maximal_reflection". The kernel also records the meeting time per batch.
+A state is a tuple (state1, state2) with each tensor having shape [batch, d].
 
-    maximal_reflection_coupling_normal(mu1, mu2, cov, sample_shape=()):
-        Performs the reflection–maximal coupling for normal distributions (Algorithm 2.2).
-"""
-
-import tensorflow as tf
-import tensorflow_probability as tfp
-
-tfd = tfp.distributions
-
-
-def maximal_coupling(p_dist, q_dist, sample_shape=()):
-    """
-    Performs maximal coupling of two distributions using the algorithm from the notes (Algorithm 2.1).
-
-    The algorithm is:
-      1. Sample X ~ p.
-      2. Sample W ~ Uniform(0, 1):
-           a. If W ≤ q(X)/p(X), then set Y = X.
-           b. Otherwise, sample Y* ~ q and W* ~ Uniform(0, 1).
-                i. If W* > p(Y*)/q(Y*), set Y = Y*.
-                ii. Otherwise, repeat step 2b.
-      3. Return the coupled pair (X, Y).
-
-    Args:
-        p_dist: A tfp.distributions.Distribution instance representing distribution p.
-        q_dist: A tfp.distributions.Distribution instance representing distribution q.
-        sample_shape: Optional sample shape to draw an initial sample.
-
-    Returns:
-        A tuple (x, y) where x ~ p_dist, y ~ q_dist, and the joint coupling is maximal.
-    """
-    # Sample x from distribution p.
-    x = p_dist.sample(sample_shape)
-    # Compute density of x under p and q.
-    p_pdf = p_dist.prob(x)
-    q_pdf = q_dist.prob(x)
-    # Draw a uniform sample for the first test.
-    u = tf.random.uniform(tf.shape(p_pdf), dtype=p_pdf.dtype)
-    # Initial acceptance test: if u <= q(x)/p(x), then set y = x.
-    accept_mask = tf.less_equal(u, q_pdf / p_pdf)
-    y = tf.where(accept_mask, x, tf.zeros_like(x))
-
-    # For indices where initial candidate is not accepted, run a while_loop.
-    def cond(y, mask):
-        # Continue if there is any element not yet accepted.
-        return tf.reduce_any(tf.logical_not(mask))
-
-    def body(y, mask):
-        # For the indices that are not accepted, sample candidate from q.
-        candidate = q_dist.sample(tf.shape(tf.boolean_mask(x, tf.logical_not(mask))))
-        u_candidate = tf.random.uniform(tf.shape(tf.boolean_mask(p_pdf, tf.logical_not(mask))),
-                                        dtype=p_pdf.dtype)
-        p_candidate = p_dist.prob(candidate)
-        q_candidate = q_dist.prob(candidate)
-        candidate_accept = tf.greater(u_candidate, p_candidate / q_candidate)
-        # Update y for accepted candidates.
-        indices = tf.where(tf.logical_not(mask))
-        # candidate_accept is a boolean tensor with shape matching number of not-yet-accepted indices.
-        accepted_candidate = tf.boolean_mask(candidate, candidate_accept)
-        # Only update those indices where candidate_accept is True.
-        # To avoid shape mismatch, update if and only if at least one candidate was accepted.
-        def update_y():
-            new_y = tf.tensor_scatter_nd_update(y, tf.boolean_mask(indices, candidate_accept), accepted_candidate)
-            new_mask = tf.tensor_scatter_nd_update(mask, indices, candidate_accept)
-            return new_y, new_mask
-        def no_update():
-            return y, mask
-        y, mask = tf.cond(tf.reduce_any(candidate_accept), update_y, no_update)
-        return y, mask
-
-    accepted_mask = accept_mask
-    y, accepted_mask = tf.while_loop(cond, body, (y, accepted_mask),
-                                     shape_invariants=(tf.TensorShape(None), tf.TensorShape(None)))
-    # For indices accepted initially, set y = x.
-    y = tf.where(accepted_mask, x, y)
-    return x, y
-
-
-def maximal_reflection_coupling_normal(mu1, mu2, cov, sample_shape=()):
-    """
-    Implements the reflection–maximal coupling of two Gaussian distributions N(mu1, cov) and N(mu2, cov)
-    as described in Algorithm 2.2 in the notes.
-
-    The algorithm is as follows:
-      1. Let z = L^(-1)(mu1 - mu2) and e = z / ||z||.
-      2. Sample X_dot ~ N(0, I) and U ~ Uniform(0, 1).
-           a. If U ≤ exp(-<X_dot, z> - 0.5 * ||z||^2), then set Y_dot = X_dot + z.
-           b. Otherwise, set Y_dot = X_dot - 2·(<X_dot, e>)*e.
-      3. Set X = L * X_dot + mu1, Y = L * Y_dot + mu2 and return (X, Y).
-
-    Args:
-        mu1: Mean of the first Gaussian. Tensor of shape [..., d].
-        mu2: Mean of the second Gaussian. Tensor of the same shape as mu1.
-        cov: Covariance matrix. Tensor of shape [d, d].
-        sample_shape: Optional sample shape.
-
-    Returns:
-        A tuple (X, Y) which are coupled samples from N(mu1, cov) and N(mu2, cov), respectively.
-    """
-    # Compute the Cholesky factor of the covariance.
-    L = tf.linalg.cholesky(cov)
-    d = tf.shape(L)[0]
-    # Compute L^-1 using triangular solve.
-    identity = tf.eye(d, dtype=L.dtype)
-    L_inv = tf.linalg.triangular_solve(L, identity)
-  
-    mu1 = tf.convert_to_tensor(mu1)
-    mu2 = tf.convert_to_tensor(mu2)
-  
-    # Compute z = L^-1 (mu1 - mu2) and then e = z / ||z||.
-    z = tf.linalg.matvec(L_inv, (mu1 - mu2))
-    z_norm = tf.norm(z, axis=-1, keepdims=True) + 1e-10
-    e = z / z_norm
-
-    # Sample X_dot ~ N(0, I) with shape matching mu1.
-    X_dot = tf.random.normal(tf.concat([tf.shape(mu1)[:-1], [d]], axis=0), dtype=mu1.dtype)
-    U = tf.random.uniform(tf.shape(X_dot)[:-1] + [1], dtype=mu1.dtype)
-    # Compute ratio = exp(-<X_dot, z> - 0.5 * ||z||^2).
-    dot_Xz = tf.reduce_sum(X_dot * z, axis=-1, keepdims=True)
-    ratio = tf.exp(-dot_Xz - 0.5 * tf.reduce_sum(z * z, axis=-1, keepdims=True))
-    condition = tf.less_equal(U, ratio)
-    # Compute reflected value: Y_dot = X_dot - 2·(<X_dot, e>)*e.
-    dot_Xe = tf.reduce_sum(X_dot * e, axis=-1, keepdims=True)
-    reflected = X_dot - 2 * dot_Xe * e
-    Y_dot = tf.where(condition, X_dot + z, reflected)
-    # Transform back.
-    X = tf.linalg.matvec(L, X_dot) + mu1
-    Y = tf.linalg.matvec(L, Y_dot) + mu2
-    return X, Y
-
-
-
-# File: unbiased_mh_kernel.py
-"""
-This module implements an unbiased Metropolis–Hastings transition kernel for coupled chains,
-based on a maximally coupled proposal kernel (roughly following Algorithm 3.4 in the notes).
-
-The kernel is implemented as a subclass of tfp.mcmc.TransitionKernel so that it can be used within
-TFP’s MCMC framework. In our implementation each chain state is a tuple containing:
-    - x: the state of the first Markov chain.
-    - y: the state of the second Markov chain.
-    - already_met: a Boolean tensor indicating whether the chains have already met.
-    - meeting_time: an integer tensor recording when the meeting occurred.
-    - step: the current iteration number.
-
-All random operations support batching.
+It is assumed that the coupling algorithms (maximal_coupling and
+maximal_reflection_coupling_normal) are provided in the module coupling_algorithms.
 """
 
 import tensorflow as tf
 import tensorflow_probability as tfp
-import collections
 
-from coupling_algorithms import maximal_coupling
+from coupling_algorithms import maximal_coupling, maximal_reflection_coupling_normal
 
 tfd = tfp.distributions
 
-# Define the state structure for the coupled kernel.
-UnbiasedMHState = collections.namedtuple(
-    "UnbiasedMHState", ["x", "y", "already_met", "meeting_time", "step"])
+class CoupledMetropolisHastingsKernel(tfp.mcmc.TransitionKernel):
+    def __init__(self,
+                 target_log_prob_fn,
+                 proposal_var,
+                 coupling_method="maximal",
+                 max_iter=10,
+                 seed=None,
+                 name="CoupledMetropolisHastingsKernel"):
+        """
+        Initialize the coupled MH kernel.
 
-
-class UnbiasedMHKernel(tfp.mcmc.TransitionKernel):
-    """
-    Unbiased Metropolis–Hastings kernel for coupled Markov chains.
-    
-    This kernel updates a state tuple (x, y, already_met, meeting_time, step) as follows:
-    
-        - If the chains have already met (already_met is True), the state is kept constant.
-        - Otherwise, a coupled proposal is generated via a maximal coupling of two symmetric proposal distributions.
-        - If the proposals are identical (within tolerance), a common uniform random value is used
-          to decide acceptance for both chains.
-        - Otherwise, independent uniform random values are used.
-        - Once the updated states match (within tolerance) the flag already_met is set, and the meeting time is recorded.
-    
-    Attributes:
-        target_log_prob_fn: A callable that takes a state (tensor) and returns its log density.
-        proposal_scale: A scalar or tensor for the scale (standard deviation) of the Gaussian Random-Walk proposal.
-        proposal_tol: Tolerance for checking equality of proposals.
-    """
-    def __init__(self, target_log_prob_fn, proposal_scale, proposal_tol=1e-6, name="UnbiasedMHKernel"):
+        Args:
+            target_log_prob_fn: Function that takes a state (shape [batch, d])
+                                and returns the log target density (shape [batch]).
+            proposal_var: Scalar representing the variance of the Gaussian proposal.
+            coupling_method: String ("maximal" or "maximal_reflection") to choose the coupling algorithm.
+            max_iter: Fixed number of iterations for the "maximal" coupling method.
+            seed: Optional seed for randomness.
+            name: Name of the kernel.
+        """
         self._target_log_prob_fn = target_log_prob_fn
-        self._proposal_scale = proposal_scale
-        self._proposal_tol = proposal_tol
+        self._proposal_var = proposal_var
+        self._coupling_method = coupling_method
+        self._max_iter = max_iter
+        self._seed_stream = tfp.util.SeedStream(seed, salt=name)
         self._name = name
 
     @property
     def is_calibrated(self):
-        # Our kernel preserves the target by construction.
+        """MH kernel is calibrated."""
         return True
 
-    def one_step(self, current_state, previous_kernel_results=None):
+    def one_step(self, current_state, previous_kernel_results):
         """
-        Performs a single transition of the coupled MH kernel.
-        
+        Perform one MH step and update meeting time.
+
         Args:
-            current_state: An UnbiasedMHState namedtuple.
-            previous_kernel_results: Not used.
-        
+            current_state: A tuple (state1, state2) where each tensor has shape [batch, d].
+            previous_kernel_results: A dict from the previous iteration; must include "t" (iteration counter)
+                                     and "meeting_time" (an int32 tensor of shape [batch]).
         Returns:
-            next_state: An updated UnbiasedMHState.
-            kernel_results: A dictionary containing additional debugging information.
+            new_state: A tuple (new_state1, new_state2).
+            new_kernel_results: A dict with updated kernel results.
         """
-        x, y, already_met, meeting_time, step = current_state
+        with tf.name_scope(self._name + ".one_step"):
+            # Unpack current state
+            state1, state2 = current_state
+            current_log_prob1 = self._target_log_prob_fn(state1)
+            current_log_prob2 = self._target_log_prob_fn(state2)
 
-        # Determine batch shape from x.
-        batch_shape = tf.shape(x)[:1]
-        dtype = x.dtype
+            # Determine dimension and batch size (assumed static)
+            stat_shape = state1.shape.as_list()
+            if stat_shape[-1] is None or stat_shape[0] is None:
+                raise ValueError("Batch and event dimensions must be statically known.")
+            d = stat_shape[-1]
+            batch_size = stat_shape[0]
 
-        # If already met, do not update.
-        def already_met_update():
-            return UnbiasedMHState(x, y, already_met, meeting_time, step + 1), {"accepted": tf.ones(batch_shape, dtype=tf.bool)}
+            # Compute proposal standard deviation
+            scale = tf.sqrt(tf.cast(self._proposal_var, state1.dtype))
+            scale_diag = tf.fill([d], scale)
+            proposal_d1 = tfd.MultivariateNormalDiag(loc=state1, scale_diag=scale_diag)
+            proposal_d2 = tfd.MultivariateNormalDiag(loc=state2, scale_diag=scale_diag)
 
-        # Otherwise, perform coupled MH update.
-        def coupled_update():
-            # Build symmetric Gaussian Random-Walk proposals:
-            # For each chain element, propose from Normal(loc=state, scale=proposal_scale)
-            p_dist = tfd.Normal(loc=x, scale=self._proposal_scale)
-            q_dist = tfd.Normal(loc=y, scale=self._proposal_scale)
-            # Use the maximal coupling function from our coupling module.
-            proposal_x, proposal_y = maximal_coupling(p_dist, q_dist)
+            # Generate candidate proposals using the chosen coupling method.
+            if self._coupling_method == "maximal":
+                candidate1, candidate2 = maximal_coupling(
+                    proposal_d1, proposal_d2, batch_shape=(batch_size,), max_iter=self._max_iter)
+            elif self._coupling_method == "maximal_reflection":
+                # For maximal reflection, build a batch of covariance matrices.
+                cov_matrix = tf.eye(d, dtype=state1.dtype) * self._proposal_var
+                cov = tf.tile(tf.expand_dims(cov_matrix, axis=0), [batch_size, 1, 1])
+                candidate1, candidate2 = maximal_reflection_coupling_normal(state1, state2, cov)
+            else:
+                raise ValueError("Unknown coupling_method: {}".format(self._coupling_method))
 
-            # Compute target log probability for current and proposed states.
-            current_logp_x = self._target_log_prob_fn(x)
-            current_logp_y = self._target_log_prob_fn(y)
-            proposed_logp_x = self._target_log_prob_fn(proposal_x)
-            proposed_logp_y = self._target_log_prob_fn(proposal_y)
+            # Compute candidate log densities.
+            candidate_log_prob1 = self._target_log_prob_fn(candidate1)
+            candidate_log_prob2 = self._target_log_prob_fn(candidate2)
 
-            # For symmetric proposals, acceptance probability is:
-            # a = min(1, exp(proposed_logp - current_logp))
-            a_x = tf.minimum(tf.ones_like(current_logp_x), tf.exp(proposed_logp_x - current_logp_x))
-            a_y = tf.minimum(tf.ones_like(current_logp_y), tf.exp(proposed_logp_y - current_logp_y))
+            # Compute log acceptance ratios (symmetric proposal).
+            log_alpha1 = candidate_log_prob1 - current_log_prob1
+            log_alpha2 = candidate_log_prob2 - current_log_prob2
 
-            # Check whether the coupled proposals are (approximately) equal.
-            proposals_equal = tf.reduce_all(tf.less_equal(tf.abs(proposal_x - proposal_y), self._proposal_tol), axis=-1)
+            # Determine if the candidate proposals are coupled (approximately equal).
+            tol = tf.cast(1e-5, state1.dtype)
+            coupled = tf.reduce_all(tf.abs(candidate1 - candidate2) < tol, axis=-1)  # shape [batch]
 
-            # If proposals are equal then use a common uniform random draw; otherwise use independent ones.
-            u_common = tf.random.uniform(batch_shape, dtype=dtype)
-            u_indep_x = tf.random.uniform(batch_shape, dtype=dtype)
-            u_indep_y = tf.random.uniform(batch_shape, dtype=dtype)
+            # Use common random numbers for coupled cases.
+            u_common = tf.random.uniform([batch_size], dtype=state1.dtype, seed=self._seed_stream())
+            u1 = tf.where(coupled,
+                          u_common,
+                          tf.random.uniform([batch_size], dtype=state1.dtype, seed=self._seed_stream()))
+            u2 = tf.where(coupled,
+                          u_common,
+                          tf.random.uniform([batch_size], dtype=state1.dtype, seed=self._seed_stream()))
 
-            # Decide acceptance for each chain.
-            accept_x = tf.where(proposals_equal, tf.less(u_common, a_x), tf.less(u_indep_x, a_x))
-            accept_y = tf.where(proposals_equal, tf.less(u_common, a_y), tf.less(u_indep_y, a_y))
+            # MH acceptance: accept if log(u) < min(0, log_alpha)
+            accept1 = tf.math.log(u1) < tf.minimum(0.0, log_alpha1)
+            accept2 = tf.math.log(u2) < tf.minimum(0.0, log_alpha2)
 
-            # Update states: if accepted, move to the proposal; else remain.
-            new_x = tf.where(accept_x[..., None], proposal_x, x)
-            new_y = tf.where(accept_y[..., None], proposal_y, y)
+            new_state1 = tf.where(tf.expand_dims(accept1, -1), candidate1, state1)
+            new_state2 = tf.where(tf.expand_dims(accept2, -1), candidate2, state2)
 
-            # Check if chains have met (within tolerance)
-            new_meet = tf.reduce_all(tf.less_equal(tf.abs(new_x - new_y), self._proposal_tol), axis=-1)
-            # Update the already_met flag: either previous flag is true or meeting is achieved in this step.
-            new_already_met = tf.logical_or(already_met, new_meet)
-            # Record the meeting time (only update for chains that meet for the first time).
-            new_meeting_time = tf.where(tf.logical_and(tf.logical_not(already_met), new_meet),
-                                        step + 1 * tf.ones_like(meeting_time, dtype=meeting_time.dtype),
-                                        meeting_time)
+            # Update iteration counter.
+            current_t = previous_kernel_results["t"]
+            new_t = current_t + 1
 
-            return UnbiasedMHState(new_x, new_y, new_already_met, new_meeting_time, step + 1), {
-                "accepted": tf.stack([accept_x, accept_y], axis=0),
-                "proposals_equal": proposals_equal
+            # Update meeting time: if chains are coupled (for batches not yet met), record meeting time.
+            old_meeting_time = previous_kernel_results["meeting_time"]  # shape [batch]
+            met_now = tf.reduce_all(tf.abs(new_state1 - new_state2) < tol, axis=1)
+            new_meeting_time = tf.where(tf.logical_and(tf.equal(old_meeting_time, -1), met_now),
+                                        new_t,
+                                        old_meeting_time)
+
+            new_kernel_results = {
+                "target_log_prob": (tf.where(accept1, candidate_log_prob1, current_log_prob1),
+                                    tf.where(accept2, candidate_log_prob2, current_log_prob2)),
+                "accepted": (accept1, accept2),
+                "proposals": (candidate1, candidate2),
+                "current_log_prob": (current_log_prob1, current_log_prob2),
+                "t": new_t,
+                "meeting_time": new_meeting_time
             }
+            new_state = (new_state1, new_state2)
+            return new_state, new_kernel_results
 
-        next_state, info = tf.cond(tf.reduce_all(already_met),
-                                     already_met_update,
-                                     coupled_update)
-        return next_state, info
-
-    def bootstrap_results(self, init_state):
+    def bootstrap_results(self, current_state):
         """
-        Initializes the kernel results.
-
-        Args:
-            init_state: A tuple (x, y) representing the initial state for both chains.
-
-        Returns:
-            An UnbiasedMHState with meeting flag set to False, meeting_time set to 0 and step=0.
+        Initialize the kernel results.
+        Fields: "t" is the iteration counter and "meeting_time" is set to 0 for coupled chains
+        and -1 otherwise.
         """
-        x, y = init_state
-        batch_shape = tf.shape(x)[:1]
-        already_met = tf.fill(batch_shape, False)
-        meeting_time = tf.zeros(batch_shape, dtype=tf.int32)
-        step = tf.constant(0, dtype=tf.int32)
-        return UnbiasedMHState(x, y, already_met, meeting_time, step)
-
-
-
-# File: unbiased_hmc_kernel.py
-"""
-This module implements an unbiased Hamiltonian Monte Carlo (HMC) kernel for coupled chains.
-The kernel uses a coupled HMC update (Algorithm 3.5) and mixes with the unbiased MH kernel
-(from unbiased_mh_kernel.py) with a configurable mixing probability.
-
-The overall transition kernel is implemented as a subclass of tfp.mcmc.TransitionKernel.
-Each state is represented by a tuple (x, y, already_met, meeting_time, step).
-
-In the coupled HMC step:
-    1. A common momentum is drawn for both chains.
-    2. Each chain uses the same momentum and performs leapfrog integration.
-    3. The acceptance probabilities are computed and a common uniform (per chain) is used.
-    4. When the proposals are accepted, the chain moves; otherwise it stays.
-This helps bring the chains together. In regions where HMC performs poorly for coupling,
-the kernel mixes in the unbiased MH update.
-"""
-
-import tensorflow as tf
-import tensorflow_probability as tfp
-import collections
-
-from unbiased_mh_kernel import UnbiasedMHKernel, UnbiasedMHState
-
-tfd = tfp.distributions
-
-class UnbiasedHMCKernel(tfp.mcmc.TransitionKernel):
-    """
-    Unbiased Hamiltonian Monte Carlo kernel with a mixed kernel proposal.
-
-    Attributes:
-        target_log_prob_fn: A callable that returns the log probability (up to constant) for a given state.
-        step_size: The leapfrog step size.
-        num_leapfrog_steps: The number of leapfrog steps to perform.
-        mixing_prob: The probability with which to use the HMC update rather than the MH fallback.
-        proposal_scale: The proposal scale for the MH kernel fallback.
-    """
-    def __init__(self, target_log_prob_fn, step_size, num_leapfrog_steps,
-                 mixing_prob=0.9, proposal_scale=0.1, name="UnbiasedHMCKernel"):
-        self._target_log_prob_fn = target_log_prob_fn
-        self._step_size = step_size
-        self._num_leapfrog_steps = num_leapfrog_steps
-        self._mixing_prob = mixing_prob
-        self._proposal_scale = proposal_scale
-        # Instantiate an unbiased MH kernel for fallback.
-        self._mh_kernel = UnbiasedMHKernel(target_log_prob_fn, proposal_scale)
-        self._name = name
-
-    @property
-    def is_calibrated(self):
-        return True
-
-    def one_step(self, current_state, previous_kernel_results=None):
-        """
-        Performs one step of the mixed unbiased HMC kernel.
-
-        With probability mixing_prob the kernel calls the coupled HMC update,
-        otherwise it calls the unbiased MH update.
-
-        Args:
-            current_state: An UnbiasedMHState namedtuple.
-            previous_kernel_results: Not used.
-
-        Returns:
-            next_state and a dictionary with diagnostic information.
-        """
-        x, y, already_met, meeting_time, step = current_state
-        batch_shape = tf.shape(x)[:1]
-        dtype = x.dtype
-
-        def hmc_step():
-            return self._coupled_hmc_step(current_state)
-
-        def mh_step():
-            return self._mh_kernel.one_step(current_state)
-
-        # Draw a uniform random value for each chain element to decide which kernel to use.
-        u = tf.random.uniform(batch_shape, dtype=dtype)
-        use_hmc = tf.less(u, self._mixing_prob)
-        # We use tf.where on a per–batch basis.
-        next_state_hmc, info_hmc = hmc_step()
-        next_state_mh, info_mh = mh_step()
-        # For each chain element, choose the HMC update if use_hmc==True, else use MH update.
-        new_x = tf.where(tf.expand_dims(use_hmc, -1), next_state_hmc.x, next_state_mh.x)
-        new_y = tf.where(tf.expand_dims(use_hmc, -1), next_state_hmc.y, next_state_mh.y)
-        new_already_met = tf.where(use_hmc, next_state_hmc.already_met, next_state_mh.already_met)
-        new_meeting_time = tf.where(use_hmc, next_state_hmc.meeting_time, next_state_mh.meeting_time)
-        new_step = tf.where(use_hmc, next_state_hmc.step, next_state_mh.step)
-        
-        # Combine diagnostic info.
-        info = {"used_hmc": use_hmc,
-                "hmc_info": info_hmc,
-                "mh_info": info_mh}
-        next_state = UnbiasedMHState(new_x, new_y, new_already_met, new_meeting_time, new_step)
-        return next_state, info
-
-    def _coupled_hmc_step(self, current_state):
-        """
-        Performs a single coupled HMC update (Algorithm 3.5) on the coupled state.
-        
-        The algorithm:
-          1. Sample a common momentum.
-          2. For each chain, run L leapfrog steps starting at (q, p) with q=x (or y) and the same p.
-          3. Compute the acceptance probabilities.
-          4. Use a common (or independent) uniform to accept/reject.
-          5. Update the meeting flag if the two resulting states are within tolerance.
-        
-        Args:
-            current_state: An UnbiasedMHState namedtuple.
-        
-        Returns:
-            next_state: An updated UnbiasedMHState.
-            info: A dictionary with diagnostic information.
-        """
-        x, y, already_met, meeting_time, step = current_state
-        batch_shape = tf.shape(x)[:1]
-        dtype = x.dtype
-
-        # If chains have already met, simply return the same state.
-        def already_met_update():
-            return UnbiasedMHState(x, y, already_met, meeting_time, step + 1), {"method": "hmc_already_met"}
-
-        def hmc_update():
-            # For simplicity we assume a Euclidean HMC with identity mass matrix.
-            # Define the potential energy function: U(q) = -target_log_prob(q)
-            def U(q):
-                return -self._target_log_prob_fn(q)
-            # Its gradient:
-            grad_U = tf.gradients(U(x), x)[0]  # Note: this is a simple placeholder; in practice use autodiff.
-            # Sample a common momentum p ~ N(0,I) with the same shape as x.
-            p0 = tf.random.normal(tf.shape(x), dtype=dtype)
-            # Record the initial Hamiltonian.
-            def hamiltonian(q, p):
-                kinetic = 0.5 * tf.reduce_sum(p * p, axis=-1)
-                potential = U(q)
-                return potential + kinetic
-
-            H0_x = hamiltonian(x, p0)
-            H0_y = hamiltonian(y, p0)
-
-            # Define a leapfrog integrator.
-            def leapfrog(q, p):
-                q_new = q
-                p_new = p
-                for _ in range(self._num_leapfrog_steps):
-                    # Half step for momentum.
-                    with tf.GradientTape() as tape:
-                        tape.watch(q_new)
-                        U_q = U(q_new)
-                    grad_u = tape.gradient(U_q, q_new)
-                    p_new = p_new - 0.5 * self._step_size * grad_u
-                    # Full step for position.
-                    q_new = q_new + self._step_size * p_new
-                    # Another half step for momentum.
-                    with tf.GradientTape() as tape:
-                        tape.watch(q_new)
-                        U_q = U(q_new)
-                    grad_u = tape.gradient(U_q, q_new)
-                    p_new = p_new - 0.5 * self._step_size * grad_u
-                return q_new, p_new
-
-            q_prop_x, p_prop_x = leapfrog(x, p0)
-            q_prop_y, p_prop_y = leapfrog(y, p0)
-
-            # Compute Hamiltonians after leapfrog.
-            H_prop_x = hamiltonian(q_prop_x, p_prop_x)
-            H_prop_y = hamiltonian(q_prop_y, p_prop_y)
-
-            # Acceptance probabilities:
-            a_x = tf.minimum(tf.ones(batch_shape, dtype=dtype), tf.exp(H0_x - H_prop_x))
-            a_y = tf.minimum(tf.ones(batch_shape, dtype=dtype), tf.exp(H0_y - H_prop_y))
-
-            # Use common uniform random variable for both chains.
-            u = tf.random.uniform(batch_shape, dtype=dtype)
-            accept_x = tf.less(u, a_x)
-            accept_y = tf.less(u, a_y)
-
-            new_x = tf.where(tf.expand_dims(accept_x, -1), q_prop_x, x)
-            new_y = tf.where(tf.expand_dims(accept_y, -1), q_prop_y, y)
-            # Update meeting flag if the new states are close.
-            tol = 1e-6
-            meet = tf.reduce_all(tf.less_equal(tf.abs(new_x - new_y), tol), axis=-1)
-            new_already_met = tf.logical_or(already_met, meet)
-            new_meeting_time = tf.where(tf.logical_and(tf.logical_not(already_met), meet),
-                                        step + 1 * tf.ones_like(meeting_time, dtype=meeting_time.dtype),
-                                        meeting_time)
-            return UnbiasedMHState(new_x, new_y, new_already_met, new_meeting_time, step + 1), {
-                "method": "hmc_update",
-                "acceptance_x": accept_x,
-                "acceptance_y": accept_y,
-            }
-        next_state, info = tf.cond(tf.reduce_all(already_met),
-                                     already_met_update,
-                                     hmc_update)
-        return next_state, info
-
-    def bootstrap_results(self, init_state):
-        """
-        Initializes the kernel state for the unbiased HMC kernel.
-        Args:
-            init_state: A tuple (x, y) representing the initial state for both chains.
-        Returns:
-            An UnbiasedMHState with already_met set to False, meeting_time to 0, and step = 0.
-        """
-        x, y = init_state
-        batch_shape = tf.shape(x)[:1]
-        already_met = tf.fill(batch_shape, False)
-        meeting_time = tf.zeros(batch_shape, dtype=tf.int32)
-        step = tf.constant(0, dtype=tf.int32)
-        return UnbiasedMHState(x, y, already_met, meeting_time, step)
-
-
-# File: test_experiment.py
-"""
-This script tests the unbiased MCMC algorithms (unbiased MH and unbiased HMC) on two target distributions:
-    (i) A banana distribution.
-    (ii) A high-dimensional multimodal normal distribution.
-
-It evaluates the meeting time, simulation speed, convergence, and sampling quality.
-The unbiased estimator is then used to compute estimates (e.g. mean) from the samples.
-
-All kernels support batching (each chain is a coupled pair) so that many coupled chains run in parallel.
-TFP’s mcmc.sample_chain function is used with the custom transition kernels.
-"""
-
-import time
-import numpy as np
-import tensorflow as tf
-import tensorflow_probability as tfp
-
-from unbiased_mh_kernel import UnbiasedMHKernel, UnbiasedMHState
-from unbiased_hmc_kernel import UnbiasedHMCKernel
-
-tfd = tfp.distributions
-tfb = tfp.bijectors
-
-# =============================================================================
-# Define target distributions
-# =============================================================================
-def banana_log_prob(x, b=0.1):
-    """
-    Computes the log density of a banana-shaped distribution.
-    
-    We first transform x = [x1, x2] to
-        y1 = x1
-        y2 = x2 + b*(x1^2 - 1)
-    and then evaluate the standard 2D normal log density.
-    
-    Args:
-        x: A tensor of shape [batch, 2].
-        b: The banana factor.
-    
-    Returns:
-        A tensor of log probabilities.
-    """
-    x1 = x[..., 0]
-    x2 = x[..., 1]
-    y1 = x1
-    y2 = x2 + b * (x1**2 - 1)
-    y = tf.stack([y1, y2], axis=-1)
-    # Standard 2D normal distribution log density.
-    log_prob = -0.5 * tf.reduce_sum(y**2, axis=-1) - tf.cast(tf.size(y[0]), y.dtype) * 0.5 * np.log(2 * np.pi)
-    return log_prob
-
-def multimodal_normal_log_prob(x, dim=10):
-    """
-    Computes the log density of a high-dimensional multimodal normal distribution.
-    
-    We construct a 50/50 mixture of two Gaussians with means at +mu0 and -mu0 and identity covariance.
-    
-    Args:
-        x: A tensor of shape [batch, dim].
-        dim: The dimensionality.
-    
-    Returns:
-        A tensor of log probabilities.
-    """
-    mu0 = tf.ones([dim], dtype=x.dtype) * 3.0
-    comp1 = tfd.MultivariateNormalDiag(loc=mu0, scale_diag=tf.ones([dim], dtype=x.dtype))
-    comp2 = tfd.MultivariateNormalDiag(loc=-mu0, scale_diag=tf.ones([dim], dtype=x.dtype))
-    mixture = tfd.MixtureSameFamily(
-        mixture_distribution=tfd.Categorical(probs=[0.5, 0.5]),
-        components_distribution=tfd.MultivariateNormalDiag(
-            loc=tf.stack([mu0, -mu0], axis=0),
-            scale_diag=tf.ones([2, dim], dtype=x.dtype)))
-    return mixture.log_prob(x)
-
-# =============================================================================
-# Define a simple unbiased estimator.
-# =============================================================================
-def compute_unbiased_estimator(chain_states, h_fn, burn_in=0):
-    """
-    Computes an unbiased estimator based on a coupled-chain trajectory.
-    
-    For demonstration we compute the estimator:
-        H = h(x_0) + sum_{t=1}^{τ-1} ( h(x_t) - h(y_{t-1}) )
-    where τ is the meeting time. In a production implementation one would average over
-    many time–indices.
-    
-    Args:
-        chain_states: A list of UnbiasedMHState objects from the MCMC trajectory.
-        h_fn: A function mapping a state to the quantity of interest.
-        burn_in: Number of initial iterations to ignore.
-    
-    Returns:
-        An unbiased estimator computed per chain (batch dimension).
-    """
-    # Assume chain_states is a list with length T (trajectory).
-    # Find the meeting time per chain.
-    meeting_times = chain_states[-1].meeting_time  # final meeting_time from the state
-    # For simplicity we use the first state h(x_0) plus correction terms.
-    h0 = h_fn(chain_states[0].x)
-    correction = tf.zeros_like(h0)
-    T = len(chain_states)
-    for t in range(1, T):
-        # Only add the correction if t is before the meeting time.
-        # Here we assume meeting_times is constant after meeting.
-        h_xt = h_fn(chain_states[t].x)
-        h_yt_prev = h_fn(chain_states[t-1].y)
-        correction += tf.where(tf.cast(t, tf.int32) < meeting_times, h_xt - h_yt_prev, tf.zeros_like(h_xt))
-    estimator = h0 + correction
-    return estimator, meeting_times
-
-# =============================================================================
-# Run experiments using the custom kernels
-# =============================================================================
-def run_experiment(target_log_prob_fn, kernel, num_results=500, num_burnin_steps=100, initial_state=None):
-    """
-    Runs an MCMC simulation using TFP’s sample_chain.
-    
-    Args:
-        target_log_prob_fn: A callable that computes the log probability.
-        kernel: A TFP TransitionKernel instance (our unbiased kernel).
-        num_results: Total number of MCMC iterations.
-        num_burnin_steps: Number of burn-in steps.
-        initial_state: A tuple (x0, y0) for the initial state.
-    
-    Returns:
-        A trajectory as a list of kernel states.
-    """
-    @tf.function
-    def run_chain():
-        samples, kernel_results = tfp.mcmc.sample_chain(
-            num_results=num_results,
-            current_state=initial_state,
-            kernel=kernel,
-            num_burnin_steps=num_burnin_steps,
-            trace_fn=lambda state, results: results)
-        return samples, kernel_results
-
-    start_time = time.time()
-    samples, kernel_results = run_chain()
-    elapsed = time.time() - start_time
-    print("Elapsed time (s):", elapsed)
-    return samples, kernel_results
-
-def main():
-    tf.random.set_seed(42)
-    # -------------------------------
-    # Test on banana distribution (2D)
-    # -------------------------------
-    print("=== Testing on Banana Distribution (2D) ===")
-    batch_size = 10
-    d = 2
-    # Initialize the two chains (coupled pair) in batch.
-    initial_x = tf.random.normal([batch_size, d])
-    initial_y = tf.random.normal([batch_size, d])
-    init_state = (initial_x, initial_y)
-    # Create an unbiased MH kernel instance.
-    mh_kernel = UnbiasedMHKernel(target_log_prob_fn=banana_log_prob, proposal_scale=0.1)
-    # Bootstrap the kernel state.
-    init_kernel_state = mh_kernel.bootstrap_results(init_state)
-    # Run sample chain.
-    samples_mh, results_mh = run_experiment(banana_log_prob, mh_kernel, num_results=500,
-                                            num_burnin_steps=100, initial_state=init_state)
-    # For simplicity, we collect the states into a list.
-    trajectory_mh = [init_kernel_state]  # starting state
-    # (In production one would record the state at every iteration.)
-    print("Final meeting times (MH):", results_mh.meeting_time)
-
-    # -------------------------------
-    # Test on high-dimensional multimodal normal (dim = 10)
-    # -------------------------------
-    print("=== Testing on Multimodal Normal Distribution (dim=10) ===")
-    dim_hd = 10
-    batch_size_hd = 10
-    initial_x_hd = tf.random.normal([batch_size_hd, dim_hd])
-    initial_y_hd = tf.random.normal([batch_size_hd, dim_hd])
-    init_state_hd = (initial_x_hd, initial_y_hd)
-    # Create an unbiased HMC kernel instance with mixing.
-    hmc_kernel = UnbiasedHMCKernel(target_log_prob_fn=lambda x: multimodal_normal_log_prob(x, dim=dim_hd),
-                                   step_size=0.1, num_leapfrog_steps=10, mixing_prob=0.9, proposal_scale=0.1)
-    init_kernel_state_hd = hmc_kernel.bootstrap_results(init_state_hd)
-    samples_hmc, results_hmc = run_experiment(lambda x: multimodal_normal_log_prob(x, dim=dim_hd),
-                                              hmc_kernel, num_results=500,
-                                              num_burnin_steps=100,
-                                              initial_state=init_state_hd)
-    print("Final meeting times (HMC):", results_hmc.meeting_time)
-
-    # -------------------------------
-    # Compute unbiased estimator for the mean (using x coordinate as the test function)
-    # -------------------------------
-    def h_fn(x):
-        # Test function: identity on x.
-        return x
-
-    # For demonstration we use the final samples from each kernel as if they were results of one trajectory.
-    estimator_mh, mt_mh = compute_unbiased_estimator([init_kernel_state] + [init_kernel_state], h_fn)
-    estimator_hmc, mt_hmc = compute_unbiased_estimator([init_kernel_state_hd] + [init_kernel_state_hd], h_fn)
-    
-    print("Unbiased estimator (MH) for x mean (first coordinate):", estimator_mh[:, 0])
-    print("Unbiased estimator (HMC) for x mean (first coordinate):", estimator_hmc[:, 0])
-
-    # In production, one would store the entire trajectory, compute additional diagnostics:
-    #   - Meeting time distribution.
-    #   - Effective sample size.
-    #   - Convergence diagnostics.
-    #   - Sampling quality metrics.
-    
-if __name__ == "__main__":
-    main()
+        state1, state2 = current_state
+        current_log_prob1 = self._target_log_prob_fn(state1)
+        current_log_prob2 = self._target_log_prob_fn(state2)
+        tol = tf.cast(1e-5, state1.dtype)
+        met_initial = tf.reduce_all(tf.abs(state1 - state2) < tol, axis=1)
+        batch_size = tf.shape(state1)[0]
+        meeting_time = tf.where(met_initial,
+                                tf.zeros([batch_size], dtype=tf.int32),
+                                -tf.ones([batch_size], dtype=tf.int32))
+        return {
+            "target_log_prob": (current_log_prob1, current_log_prob2),
+            "accepted": (tf.zeros(tf.shape(current_log_prob1), dtype=tf.bool),
+                         tf.zeros(tf.shape(current_log_prob2), dtype=tf.bool)),
+            "proposals": (tf.zeros_like(state1), tf.zeros_like(state2)),
+            "current_log_prob": (current_log_prob1, current_log_prob2),
+            "t": tf.constant(0, dtype=tf.int32),
+            "meeting_time": meeting_time
+        }
