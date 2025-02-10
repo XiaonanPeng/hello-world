@@ -1,0 +1,146 @@
+# File: test_unbiased_mh_sampling_integrated.py
+"""
+File: test_unbiased_mh_sampling_integrated.py
+
+This script runs comprehensive tests of the unbiased MH estimator on nontrivial
+target distributions. Two targets are used:
+  (1) A 2-dimensional banana distribution.
+  (2) A high-dimensional multimodal normal (mixture of two Gaussians).
+Tests run multiple independent replications and check that:
+  - The average estimated expected value (using h(x)=x[0]) is close to 0.
+  - The meeting times recorded are reasonable.
+  - Edge cases, such as when chains are unlikely to meet, are handled.
+"""
+
+import unittest
+import tensorflow as tf
+import numpy as np
+import tensorflow_probability as tfp
+
+from coupled_mh_kernel import CoupledMetropolisHastingsKernel
+from unbiased_mcmc_estimator import UnbiasedMCMCEstimator
+
+tfd = tfp.distributions
+
+def banana_log_prob(x, b=0.1):
+    # Banana transformation for 2D input: x1 remains; x2 shifted.
+    x1 = x[:, 0]
+    x2 = x[:, 1]
+    y2 = x2 + b * (x1**2 - 1.0)
+    return -0.5 * (x1**2 + y2**2)
+
+def multimodal_log_prob(x, d=10, mu=2.0):
+    # Mixture of two equally weighted multivariate normals centered at mu and -mu.
+    center1 = tf.ones_like(x) * mu
+    center2 = -tf.ones_like(x) * mu
+    log_comp1 = -0.5 * tf.reduce_sum((x - center1)**2, axis=-1)
+    log_comp2 = -0.5 * tf.reduce_sum((x - center2)**2, axis=-1)
+    max_log = tf.maximum(log_comp1, log_comp2)
+    return max_log + tf.math.log(0.5 * tf.exp(log_comp1 - max_log) + 0.5 * tf.exp(log_comp2 - max_log))
+
+def target_log_prob_fn_standard(x):
+    # Standard normal target density.
+    return -0.5 * tf.reduce_sum(x**2, axis=-1)
+
+def h_fn(x):
+    # Function of interest: the first coordinate.
+    return x[:, 0]
+
+class TestUnbiasedMHSamplingIntegrated(unittest.TestCase):
+
+    def setUp(self):
+        tf.random.set_seed(1234)
+        np.random.seed(1234)
+        self.num_replications = 30
+        self.batch = 16
+
+    def run_replications(self, target_log_prob_fn, d, proposal_var, k, m, coupling_method="maximal", seed_base=1000):
+        estimates = []
+        meeting_times_all = []
+        for i in range(self.num_replications):
+            init_state1 = np.random.randn(self.batch, d).astype(np.float32)
+            init_state2 = np.random.randn(self.batch, d).astype(np.float32)
+            initial_state = (tf.convert_to_tensor(init_state1),
+                             tf.convert_to_tensor(init_state2))
+            kernel = CoupledMetropolisHastingsKernel(
+                target_log_prob_fn=target_log_prob_fn,
+                proposal_var=proposal_var,
+                coupling_method=coupling_method,
+                max_iter=5,
+                seed=seed_base + i)
+            estimator_obj = UnbiasedMCMCEstimator(
+                coupled_kernel=kernel,
+                h_fn=h_fn,
+                k=k,
+                m=m)
+            estimator, meeting_time = estimator_obj.run(initial_state)
+            estimates.append(tf.reduce_mean(estimator).numpy())
+            meeting_times_all.append(meeting_time.numpy())
+        estimates = np.array(estimates)
+        return estimates, meeting_times_all
+
+    def test_banana_distribution(self):
+        # Test unbiased estimation on a 2D banana distribution.
+        d = 2
+        proposal_var = 1.0
+        k = 10
+        m = 20
+        estimates, meeting_times_all = self.run_replications(
+            target_log_prob_fn=lambda x: banana_log_prob(x, b=0.1),
+            d=d,
+            proposal_var=proposal_var,
+            k=k,
+            m=m,
+            coupling_method="maximal")
+        mean_estimate = np.mean(estimates)
+        std_estimate = np.std(estimates)
+        print("Banana distribution - Mean estimate: {:.3f}, Std: {:.3f}".format(mean_estimate, std_estimate))
+        self.assertTrue(abs(mean_estimate) < 0.3,
+                        "Mean estimate for banana distribution should be near 0.")
+        mt_concat = np.concatenate(meeting_times_all)
+        self.assertTrue(np.mean(mt_concat[mt_concat >= 0]) < m + 5,
+                        "Meeting times appear abnormally high for banana distribution.")
+
+    def test_multimodal_normal(self):
+        # Test unbiased estimation on a high-dimensional multimodal normal target.
+        d = 10
+        proposal_var = 1.0
+        k = 10
+        m = 30
+        estimates, meeting_times_all = self.run_replications(
+            target_log_prob_fn=lambda x: multimodal_log_prob(x, d=d, mu=2.0),
+            d=d,
+            proposal_var=proposal_var,
+            k=k,
+            m=m,
+            coupling_method="maximal")
+        mean_estimate = np.mean(estimates)
+        std_estimate = np.std(estimates)
+        print("Multimodal normal - Mean estimate: {:.3f}, Std: {:.3f}".format(mean_estimate, std_estimate))
+        self.assertTrue(abs(mean_estimate) < 0.3,
+                        "Mean estimate for multimodal target should be near 0.")
+        mt_concat = np.concatenate(meeting_times_all)
+        self.assertTrue(np.all((mt_concat == -1) | (mt_concat >= k)),
+                        "Each meeting time should be either -1 (not met) or at least k.")
+
+    def test_edge_case_no_meeting(self):
+        # Test an edge case by using an extremely small proposal variance such that chains are unlikely to move.
+        d = 3
+        proposal_var = 0.0001  # Extremely small variance
+        k = 5
+        m = 15
+        estimates, meeting_times_all = self.run_replications(
+            target_log_prob_fn=target_log_prob_fn_standard,
+            d=d,
+            proposal_var=proposal_var,
+            k=k,
+            m=m,
+            coupling_method="maximal")
+        mt_concat = np.concatenate(meeting_times_all)
+        # In this scenario, many chains are expected to not meet.
+        prop_no_meet = np.mean(mt_concat == -1)
+        print("Edge case no meeting: proportion of chains not met =", prop_no_meet)
+        self.assertTrue(prop_no_meet > 0.3, "Expected many chains to not meet with extremely small proposal variance.")
+
+if __name__ == "__main__":
+    unittest.main()
