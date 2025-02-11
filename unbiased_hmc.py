@@ -128,116 +128,116 @@ class UnbiasedHMC(tfp.mcmc.TransitionKernel):
 
     def bootstrap_results(self, current_state):
         """
-        Bootstraps the kernel results for both HMC and MH components.
+        Initialize kernel results using the previous bootstrap format.
         
         Args:
-          current_state: Tuple (state_x, state_y) representing the initial states for the two chains.
+          current_state: Tuple (X, Y) of two chain states.
         
         Returns:
           A dictionary with keys:
-            "hmc": Dictionary with bootstrap results for HMC component for each chain.
-            "mh": Dictionary with bootstrap results for MH component (if applicable).
-            "iteration": Tensor scalar (int32), initially 0.
-            "meeting_time": Tensor of shape [batch] recording the meeting iteration; 0 if already coupled,
-                            otherwise -1.
-            "seed": The common seed.
-            "step_type": A string indicator, initially "none".
+            "target_log_prob": (logp_X, logp_Y)
+            "accepted": (zeros, zeros)
+            "proposals": (zeros_like(X), zeros_like(Y))
+            "current_log_prob": (logp_X, logp_Y)
+            "t": iteration counter (initialized as 0)
+            "meeting_time": a tensor of shape [batch] that is 0 where the chains meet initially, and -1 otherwise.
         """
-        state_x, state_y = current_state
-        hmc_res_x = self._hmc.bootstrap_results(state_x)
-        hmc_res_y = self._hmc.bootstrap_results(state_y)
-        hmc_results = {"x": hmc_res_x, "y": hmc_res_y}
-        
-        if self._mh_kernel is not None:
-            mh_res_x = self._mh_kernel.bootstrap_results(state_x)
-            mh_res_y = self._mh_kernel.bootstrap_results(state_y)
-            mh_results = {"x": mh_res_x, "y": mh_res_y}
-        else:
-            mh_results = None
-        
-        diff = tf.reduce_max(tf.abs(state_x - state_y), axis=-1)
-        meeting_time = tf.where(diff < self._tolerance,
-                                tf.zeros_like(diff, dtype=tf.int32),
-                                -tf.ones_like(diff, dtype=tf.int32))
-        
+        X, Y = current_state
+        logp_X = self._target_log_prob_fn(X)
+        logp_Y = self._target_log_prob_fn(Y)
+        tol = tf.cast(self._tolerance, X.dtype)  # use the provided tolerance
+        met_initial = tf.reduce_all(tf.abs(X - Y) < tol, axis=1)
+        batch_size = tf.shape(X)[0]
+        meeting_time = tf.where(met_initial,
+                                tf.zeros([batch_size], dtype=tf.int32),
+                                -tf.ones([batch_size], dtype=tf.int32))
         return {
-            "hmc": hmc_results,
-            "mh": mh_results,
-            "iteration": tf.constant(0, dtype=tf.int32),
-            "meeting_time": meeting_time,
-            "seed": self._seed,
-            "step_type": tf.constant("none")
+            "target_log_prob": (logp_X, logp_Y),
+            "accepted": (tf.zeros(tf.shape(logp_X), dtype=tf.bool),
+                         tf.zeros(tf.shape(logp_Y), dtype=tf.bool)),
+            "proposals": (tf.zeros_like(X), tf.zeros_like(Y)),
+            "current_log_prob": (logp_X, logp_Y),
+            "t": tf.constant(0, dtype=tf.int32),
+            "meeting_time": meeting_time
         }
 
     def one_step(self, current_state, previous_kernel_results):
         """
-        Performs one iteration of the mixed kernel.
+        Performs one update step of the mixed kernel.
         
-        With probability mix_prob, the kernel applies the coupled MH update; otherwise, it applies
-        the coupled HMC update (Algorithm 3.5). Both updates share common randomness via stateless ops.
+        At each step, a stateless coin toss (seed shaped [2]: [seed, t]) decides whether to use the
+        coupled MH update (if coin < mix_prob) or the coupled HMC update.
+        
+        In both cases, the update is performed on each chain independently using the underlying kernel’s
+        one_step function (with a fresh bootstrap result), and then the new target log probabilities are computed.
+        The meeting_time is updated if a chain has not met previously and now |X - Y| < tolerance.
         
         Args:
-          current_state: Tuple (state_x, state_y) for the two current chain states.
-          previous_kernel_results: Dictionary from bootstrap_results or a previous one_step call.
+          current_state: Tuple (X, Y) representing the current states.
+          previous_kernel_results: Dictionary in the bootstrap format.
         
         Returns:
-          new_state: Updated state tuple (new_state_x, new_state_y).
-          new_kernel_results: Updated dictionary containing internal HMC and MH results, iteration,
-                              meeting_time, seed, and step_type indicator.
+          new_state: Tuple (new_X, new_Y) after the update.
+          new_kernel_results: Dictionary updated with new target log probabilities, iteration t,
+                              and meeting_time.
         """
-        state_x, state_y = current_state
-        iteration = previous_kernel_results["iteration"] + 1
-        
-        # Generate a coin toss using stateless uniform with a seed that depends on iteration
-        coin_seed = tf.stack([tf.cast(self._seed, tf.int32), iteration])
+        X, Y = current_state
+        t_old = previous_kernel_results["t"]
+        new_t = t_old + 1
+
+        # Generate a coin toss seed of shape [2]: [seed, new_t]
+        coin_seed = tf.stack([tf.cast(self._seed, tf.int32), new_t])
         coin = tf.random.stateless_uniform([], seed=coin_seed, minval=0, maxval=1)
-        
+
+        # Define the HMC update branch.
         def hmc_update():
-            # For HMC update, use common random seed for both chains to sample common momentum
-            hmc_seed = tf.stack([tf.cast(self._seed, tf.int32), iteration, tf.constant(0, tf.int32)])
-            new_state_x, new_hmc_res_x = self._hmc.one_step(
-                state_x, previous_kernel_results["hmc"]["x"], seed=hmc_seed)
-            new_state_y, new_hmc_res_y = self._hmc.one_step(
-                state_y, previous_kernel_results["hmc"]["y"], seed=hmc_seed)
-            new_state = (new_state_x, new_state_y)
-            new_hmc_results = {"x": new_hmc_res_x, "y": new_hmc_res_y}
-            return new_state, new_hmc_results
+            # For each chain, we start from the current state and generate a fresh bootstrap for the update.
+            new_X, _ = self._hmc.one_step(
+                X,
+                self._hmc.bootstrap_results(X),
+                seed=coin_seed)
+            new_Y, _ = self._hmc.one_step(
+                Y,
+                self._hmc.bootstrap_results(Y),
+                seed=coin_seed)
+            return (new_X, new_Y)
 
+        # Define the MH update branch.
         def mh_update():
-            # For MH update, call the unbiased MH kernel update.
-            new_state_x, new_mh_res_x = self._mh_kernel.one_step(
-                state_x, previous_kernel_results["mh"]["x"])
-            new_state_y, new_mh_res_y = self._mh_kernel.one_step(
-                state_y, previous_kernel_results["mh"]["y"])
-            new_state = (new_state_x, new_state_y)
-            new_mh_results = {"x": new_mh_res_x, "y": new_mh_res_y}
-            return new_state, new_mh_results
+            # For each chain, call the MH kernel update using its bootstrap.
+            new_X, _ = self._mh_kernel.one_step(
+                X,
+                self._mh_kernel.bootstrap_results(X))
+            new_Y, _ = self._mh_kernel.one_step(
+                Y,
+                self._mh_kernel.bootstrap_results(Y))
+            return (new_X, new_Y)
 
-        # Select update branch: if coin < mix_prob then use MH update; else use HMC update.
-        use_mh = tf.less(coin, self._mix_prob) if self._mh_kernel is not None else False
-        
-        new_state, branch_results = tf.cond(use_mh,
-                                            lambda: mh_update(),
-                                            lambda: hmc_update())
-        step_type = tf.cond(use_mh, lambda: tf.constant("mh"), lambda: tf.constant("hmc"))
-        
-        # Update overall meeting_time: for each batch element, if not yet met and the max abs diff 
-        # is below tolerance, record the current iteration.
-        diff = tf.reduce_max(tf.abs(new_state[0] - new_state[1]), axis=-1)
+        # Choose update branch based on coin toss.
+        new_state = tf.cond(
+            tf.less(coin, self._mix_prob) if self._mh_kernel is not None else tf.constant(False),
+            lambda: mh_update(),
+            lambda: hmc_update()
+        )
+
+        # Compute new target log probability for both chains.
+        new_logp_X = self._target_log_prob_fn(new_state[0])
+        new_logp_Y = self._target_log_prob_fn(new_state[1])
+        tol = tf.cast(self._tolerance, new_state[0].dtype)
+        met = tf.reduce_all(tf.abs(new_state[0] - new_state[1]) < tol, axis=1)
         prev_mt = previous_kernel_results["meeting_time"]
-        new_meeting_time = tf.where((prev_mt < 0) & (diff < self._tolerance),
-                                    tf.fill(tf.shape(diff), iteration),
-                                    prev_mt)
-        
-        # Construct new kernel results; only update the branch that was actually used.
+        updated_mt = tf.where((prev_mt < 0) & met,
+                              tf.fill(tf.shape(prev_mt), new_t),
+                              prev_mt)
+
+        # Build the new kernel results in the desired format.
         new_kernel_results = {
-            "hmc": branch_results if step_type == "hmc" else previous_kernel_results["hmc"],
-            "mh": branch_results if step_type == "mh" else previous_kernel_results["mh"],
-            "iteration": iteration,
-            "meeting_time": new_meeting_time,
-            "seed": self._seed,
-            "step_type": step_type
+            "target_log_prob": (new_logp_X, new_logp_Y),
+            "accepted": (tf.zeros(tf.shape(new_logp_X), dtype=tf.bool),
+                         tf.zeros(tf.shape(new_logp_Y), dtype=tf.bool)),
+            "proposals": (tf.zeros_like(new_state[0]), tf.zeros_like(new_state[1])),
+            "current_log_prob": (new_logp_X, new_logp_Y),
+            "t": new_t,
+            "meeting_time": updated_mt
         }
         return new_state, new_kernel_results
-
-# End of module.
