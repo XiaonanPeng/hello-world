@@ -1,0 +1,315 @@
+#!/usr/bin/env python
+"""
+unbiased_multinomial_hmc.py
+
+This module implements an unbiased multinomial HMC kernel with couplings,
+based on the "Multinomial HMC.pdf" paper. It uses a mixed kernel that, at each update, 
+randomly chooses between:
+
+    - A coupled multinomial HMC update, where the proposal is selected from the full leapfrog
+      trajectory via multinomial sampling using a coupled sampling method (either maximal coupling
+      or W2 coupling).
+    - A coupled MH update via the provided UnbiasedMHKernel.
+    
+The implementation uses a simple leapfrog integrator and simulates full trajectories.
+"""
+
+import tensorflow as tf
+import tensorflow_probability as tfp
+import numpy as np
+
+from coupling import maximal_multinomial_coupling, w2_multinomial_coupling
+
+# Import the unbiased MH kernel; if unavailable, use a placeholder.
+try:
+    from unbiased_mh_kernel import UnbiasedMHKernel
+except ImportError:
+    class UnbiasedMHKernel(tfp.mcmc.TransitionKernel):
+        """
+        Placeholder UnbiasedMHKernel.
+        """
+        def __init__(self, target_log_prob_fn, proposal_std, seed=None, name="UnbiasedMHKernel"):
+            self._target_log_prob_fn = target_log_prob_fn
+            self._proposal_std = proposal_std
+            self._seed = seed if seed is not None else 42
+            self._name = name
+
+        @property
+        def is_calibrated(self):
+            return True
+
+        def bootstrap_results(self, state):
+            logp = self._target_log_prob_fn(state)
+            tol = tf.cast(1e-5, state.dtype)
+            met_initial = tf.reduce_all(tf.abs(state - state) < tol, axis=1)
+            batch_size = tf.shape(state)[0]
+            meeting_time = tf.where(met_initial,
+                                    tf.zeros([batch_size], dtype=tf.int32),
+                                    -tf.ones([batch_size], dtype=tf.int32))
+            return {
+                "target_log_prob": logp,
+                "accepted": tf.zeros(tf.shape(logp), dtype=tf.bool),
+                "proposals": tf.zeros_like(state),
+                "current_log_prob": logp,
+                "t": tf.constant(0, dtype=tf.int32),
+                "meeting_time": meeting_time
+            }
+
+        def one_step(self, state, previous_kernel_results):
+            new_t = previous_kernel_results["t"] + 1
+            logp = self._target_log_prob_fn(state)
+            tol = tf.cast(1e-5, state.dtype)
+            met = tf.reduce_all(tf.abs(state - state) < tol, axis=1)
+            meeting_time = tf.where(previous_kernel_results["meeting_time"] < 0,
+                                    tf.fill(tf.shape(previous_kernel_results["meeting_time"]), new_t),
+                                    previous_kernel_results["meeting_time"])
+            new_results = {
+                "target_log_prob": logp,
+                "accepted": tf.zeros(tf.shape(logp), dtype=tf.bool),
+                "proposals": tf.zeros_like(state),
+                "current_log_prob": logp,
+                "t": new_t,
+                "meeting_time": meeting_time
+            }
+            return state, new_results
+
+def leapfrog_integrator(q, p, step_size, target_log_prob_fn):
+    """
+    Performs one step of leapfrog integration.
+    
+    Args:
+        q: Tensor of shape [batch, d], current positions.
+        p: Tensor of shape [batch, d], current momenta.
+        step_size: Float, integration step size.
+        target_log_prob_fn: Function computing log probability at q.
+        
+    Returns:
+        q_new, p_new: Updated positions and momenta.
+    """
+    with tf.GradientTape() as tape:
+        tape.watch(q)
+        log_prob = target_log_prob_fn(q)
+    gradU = -tape.gradient(log_prob, q)
+    p_half = p - 0.5 * step_size * gradU
+    q_new = q + step_size * p_half
+    with tf.GradientTape() as tape:
+        tape.watch(q_new)
+        log_prob_new = target_log_prob_fn(q_new)
+    gradU_new = -tape.gradient(log_prob_new, q_new)
+    p_new = p_half - 0.5 * step_size * gradU_new
+    return q_new, p_new
+
+def simulate_trajectory(q0, p0, num_steps, step_size, target_log_prob_fn):
+    """
+    Simulates a leapfrog trajectory.
+    
+    Args:
+        q0: Tensor of shape [batch, d], initial positions.
+        p0: Tensor of shape [batch, d], initial momenta.
+        num_steps: Integer, number of leapfrog steps.
+        step_size: Float, integration step size.
+        target_log_prob_fn: Callable to compute log probability.
+        
+    Returns:
+        A tuple (q_traj, p_traj) where:
+            q_traj: Tensor of shape [num_steps+1, batch, d] containing positions.
+            p_traj: Tensor of shape [num_steps+1, batch, d] containing momenta.
+    """
+    q_traj = tf.TensorArray(dtype=q0.dtype, size=num_steps+1)
+    p_traj = tf.TensorArray(dtype=p0.dtype, size=num_steps+1)
+    q_traj = q_traj.write(0, q0)
+    p_traj = p_traj.write(0, p0)
+    q_curr = q0
+    p_curr = p0
+    for i in range(num_steps):
+        q_next, p_next = leapfrog_integrator(q_curr, p_curr, step_size, target_log_prob_fn)
+        q_traj = q_traj.write(i+1, q_next)
+        p_traj = p_traj.write(i+1, p_next)
+        q_curr = q_next
+        p_curr = p_next
+    q_traj = q_traj.stack()  # shape: [num_steps+1, batch, d]
+    p_traj = p_traj.stack()  # shape: [num_steps+1, batch, d]
+    return q_traj, p_traj
+
+class UnbiasedMultinomialHMC(tfp.mcmc.TransitionKernel):
+    """
+    UnbiasedMultinomialHMC implements a mixed coupling kernel for multinomial HMC.
+    
+    At every update, a stateless coin toss (using a seed of shape [2]) decides whether to:
+      - Use the coupled multinomial HMC update, in which a full leapfrog trajectory is simulated
+        and a proposal is selected from the trajectory via multinomial sampling using coupled sampling.
+      - Use the coupled MH update via the provided UnbiasedMHKernel.
+        
+    The intra-trajectory coupling uses either maximal coupling or W2 coupling as specified.
+    """
+    def __init__(self,
+                 target_log_prob_fn,
+                 step_size,
+                 num_leapfrog_steps,
+                 momentum_distribution,
+                 tolerance,
+                 mix_prob,
+                 coupling_method="maximal",  # "maximal" or "w2"
+                 reg=1e-1,
+                 proposal_std=None,
+                 seed=None,
+                 name="UnbiasedMultinomialHMC"):
+        """
+        Initializes the UnbiasedMultinomialHMC kernel.
+        
+        Args:
+            target_log_prob_fn: Callable [batch, d] -> log probability.
+            step_size: Float, leapfrog step size.
+            num_leapfrog_steps: Integer, number of leapfrog steps.
+            momentum_distribution: A tfp.distributions instance for sampling momentum.
+            tolerance: Float, threshold for chain meeting.
+            mix_prob: Float in [0,1], probability to trigger MH update.
+            coupling_method: Coupling method for intra-trajectory multinomial sampling.
+            reg: Regularization parameter for W2 coupling.
+            proposal_std: Float, proposal std for MH kernel.
+            seed: Integer, common seed.
+            name: Kernel name.
+        """
+        self._target_log_prob_fn = target_log_prob_fn
+        self._step_size = step_size
+        self._num_leapfrog_steps = num_leapfrog_steps
+        self._momentum_distribution = momentum_distribution
+        self._tolerance = tolerance
+        self._mix_prob = mix_prob
+        self._coupling_method = coupling_method
+        self._reg = reg
+        self._seed = seed if seed is not None else 42
+        self._name = name
+        
+        if self._mix_prob > 0:
+            proposal_std = proposal_std if proposal_std is not None else 1.0
+            self._mh_kernel = UnbiasedMHKernel(
+                target_log_prob_fn=self._target_log_prob_fn,
+                proposal_std=proposal_std,
+                seed=self._seed)
+        else:
+            self._mh_kernel = None
+
+    @property
+    def is_calibrated(self):
+        return True
+
+    def bootstrap_results(self, current_state):
+        """
+        Bootstraps kernel results.
+        
+        Args:
+            current_state: Tuple (X, Y) of two chain states.
+        
+        Returns:
+            A dictionary of kernel results.
+        """
+        X, Y = current_state
+        logp_X = self._target_log_prob_fn(X)
+        logp_Y = self._target_log_prob_fn(Y)
+        tol = tf.cast(self._tolerance, X.dtype)
+        met_initial = tf.reduce_all(tf.abs(X - Y) < tol, axis=1)
+        batch_size = tf.shape(X)[0]
+        meeting_time = tf.where(met_initial,
+                                tf.zeros([batch_size], dtype=tf.int32),
+                                -tf.ones([batch_size], dtype=tf.int32))
+        return {
+            "target_log_prob": (logp_X, logp_Y),
+            "accepted": (tf.zeros(tf.shape(logp_X), dtype=tf.bool),
+                         tf.zeros(tf.shape(logp_Y), dtype=tf.bool)),
+            "proposals": (tf.zeros_like(X), tf.zeros_like(Y)),
+            "current_log_prob": (logp_X, logp_Y),
+            "t": tf.constant(0, dtype=tf.int32),
+            "meeting_time": meeting_time
+        }
+    
+    def one_step(self, current_state, previous_kernel_results):
+        """
+        Performs one update step of the mixed kernel.
+        
+        With probability mix_prob the MH update is used; otherwise the coupled 
+        multinomial HMC update is applied.
+        
+        Returns:
+            new_state: Tuple (new_X, new_Y).
+            new_kernel_results: Updated kernel result dictionary.
+        """
+        X, Y = current_state
+        t_old = previous_kernel_results["t"]
+        new_t = t_old + 1
+        
+        # Generate coin toss seed with shape [2]: [seed, new_t]
+        coin_seed = tf.stack([tf.cast(self._seed, tf.int32), new_t])
+        coin = tf.random.stateless_uniform([], seed=coin_seed, minval=0, maxval=1)
+        
+        def hmc_update():
+            # Sample common momentum for both chains (batchwise).
+            batch_size = tf.shape(X)[0]
+            p = self._momentum_distribution.sample(sample_shape=[batch_size], seed=coin_seed)
+            # Simulate leapfrog trajectories for chain X and Y.
+            traj_X, traj_PX = simulate_trajectory(X, p, self._num_leapfrog_steps, self._step_size, self._target_log_prob_fn)
+            traj_Y, traj_PY = simulate_trajectory(Y, p, self._num_leapfrog_steps, self._step_size, self._target_log_prob_fn)
+            
+            # Compute energies for each trajectory point.
+            def compute_energy(traj_Q, traj_P):
+                # traj_Q, traj_P: shape [num_steps+1, batch, d]
+                logp = tf.map_fn(self._target_log_prob_fn, traj_Q)
+                kinetic = 0.5 * tf.reduce_sum(tf.square(traj_P), axis=-1)
+                return -logp + kinetic  # shape: [num_steps+1, batch]
+            energy_X = compute_energy(traj_X, traj_PX)  # [L+1, batch]
+            energy_Y = compute_energy(traj_Y, traj_PY)  # [L+1, batch]
+            # Compute weights for multinomial sampling.
+            weights_X = tf.exp(-energy_X)
+            weights_Y = tf.exp(-energy_Y)
+            norm_weights_X = weights_X / tf.reduce_sum(weights_X, axis=0, keepdims=True)
+            norm_weights_Y = weights_Y / tf.reduce_sum(weights_Y, axis=0, keepdims=True)
+            
+            # Couple the multinomial sampling for each batch element.
+            def couple_fn(prob_pair):
+                prob_X, prob_Y = prob_pair  # each: shape [L+1]
+                if self._coupling_method == "maximal":
+                    return maximal_multinomial_coupling(prob_X, prob_Y)
+                else:
+                    # For W2 coupling, we use a simple cost matrix: squared difference of indices.
+                    L_plus1 = tf.shape(prob_X)[0]
+                    indices = tf.cast(tf.range(L_plus1), tf.float32)
+                    cost_matrix = tf.square(tf.expand_dims(indices, 1) - tf.expand_dims(indices, 0))
+                    return w2_multinomial_coupling(prob_X, prob_Y, cost_matrix, reg=self._reg)
+            
+            # Transpose probability matrices so that each row corresponds to one batch element.
+            coupled_indices = tf.map_fn(couple_fn, (tf.transpose(norm_weights_X), tf.transpose(norm_weights_Y)),
+                                         dtype=(tf.int64, tf.int64))
+            idx_X = tf.cast(coupled_indices[0], tf.int32)  # shape [batch]
+            idx_Y = tf.cast(coupled_indices[1], tf.int32)  # shape [batch]
+            # Gather proposals from trajectories.
+            new_X = tf.gather(traj_X, idx_X, axis=0, batch_dims=1)
+            new_Y = tf.gather(traj_Y, idx_Y, axis=0, batch_dims=1)
+            return (new_X, new_Y), None
+        
+        def mh_update():
+            new_X, _ = self._mh_kernel.one_step(X, self._mh_kernel.bootstrap_results(X))
+            new_Y, _ = self._mh_kernel.one_step(Y, self._mh_kernel.bootstrap_results(Y))
+            return (new_X, new_Y), None
+        
+        use_mh = tf.less(coin, self._mix_prob) if self._mh_kernel is not None else tf.constant(False)
+        new_state, _ = tf.cond(use_mh, mh_update, hmc_update)
+        
+        # Update meeting time.
+        tol = tf.cast(self._tolerance, new_state[0].dtype)
+        diff = tf.reduce_max(tf.abs(new_state[0] - new_state[1]), axis=-1)
+        prev_mt = previous_kernel_results["meeting_time"]
+        updated_mt = tf.where((prev_mt < 0) & (diff < tol),
+                              tf.fill(tf.shape(prev_mt), new_t),
+                              prev_mt)
+        
+        new_kernel_results = {
+            "target_log_prob": (self._target_log_prob_fn(new_state[0]), self._target_log_prob_fn(new_state[1])),
+            "accepted": (tf.constant(False), tf.constant(False)),
+            "proposals": (tf.zeros_like(new_state[0]), tf.zeros_like(new_state[1])),
+            "current_log_prob": (self._target_log_prob_fn(new_state[0]), self._target_log_prob_fn(new_state[1])),
+            "t": new_t,
+            "meeting_time": updated_mt
+        }
+        return new_state, new_kernel_results
+
+# End of module.
