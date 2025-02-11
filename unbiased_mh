@@ -2,18 +2,20 @@
 """
 File: coupled_mh_kernel.py
 
-This file implements a coupled Metropolis-Hastings (MH) kernel for unbiased MCMC,
-integrating deeply with TensorFlow Probability (TFP) by inheriting from
-tfp.mcmc.TransitionKernel. It supports Gaussian proposals and two coupling algorithms:
-"maximal" and "maximal_reflection". The kernel also records the meeting time per batch.
-A state is a tuple (state1, state2) with each tensor having shape [batch, d].
+This file implements a coupled Metropolis-Hastings (MH) kernel based on Algorithm 3.4
+("Maximal Coupling Using Coupled Proposals (P̄_C)") from the attached document "Couplings_and_Monte_Carlo.pdf".
+It provides two available proposal coupling strategies:
+  - "maximal": using the maximal coupling (function maximal_coupling)
+  - "maximal_reflection": using the maximal reflection coupling (function maximal_reflection_coupling_normal)
+which are assumed to be already implemented in the module coupling_algorithms.
 
-It is assumed that the coupling algorithms (maximal_coupling and
-maximal_reflection_coupling_normal) are provided in the module coupling_algorithms.
+The kernel is a subclass of tfp.mcmc.TransitionKernel and also records the meeting time (per batch).
+A state is a tuple (X, Y) with each tensor shaped [batch, d].
 """
 
 import tensorflow as tf
 import tensorflow_probability as tfp
+import numpy as np
 
 from coupling_algorithms import maximal_coupling, maximal_reflection_coupling_normal
 
@@ -23,21 +25,20 @@ class CoupledMetropolisHastingsKernel(tfp.mcmc.TransitionKernel):
     def __init__(self,
                  target_log_prob_fn,
                  proposal_var,
-                 coupling_method="maximal",
-                 max_iter=10,
+                 coupling_method="maximal",  # options: "maximal" or "maximal_reflection"
+                 max_iter=5,
                  seed=None,
-                 name="CoupledMetropolisHastingsKernel"):
+                 name="CoupledMHKernel_Pc"):
         """
         Initialize the coupled MH kernel.
-
+        
         Args:
-            target_log_prob_fn: Function that takes a state (shape [batch, d])
-                                and returns the log target density (shape [batch]).
-            proposal_var: Scalar representing the variance of the Gaussian proposal.
-            coupling_method: String ("maximal" or "maximal_reflection") to choose the coupling algorithm.
-            max_iter: Fixed number of iterations for the "maximal" coupling method.
-            seed: Optional seed for randomness.
-            name: Name of the kernel.
+            target_log_prob_fn: Function mapping state (tensor of shape [batch, d]) to the log target density (tensor of shape [batch]).
+            proposal_var: Scalar variance for the Gaussian proposal.
+            coupling_method: Option for proposal coupling, choose "maximal" or "maximal_reflection".
+            max_iter: Maximum iterations for the coupling procedure in proposals.
+            seed: Optional random seed.
+            name: Kernel name.
         """
         self._target_log_prob_fn = target_log_prob_fn
         self._proposal_var = proposal_var
@@ -48,124 +49,172 @@ class CoupledMetropolisHastingsKernel(tfp.mcmc.TransitionKernel):
 
     @property
     def is_calibrated(self):
-        """MH kernel is calibrated."""
         return True
 
     def one_step(self, current_state, previous_kernel_results):
         """
-        Perform one MH step and update meeting time.
-
+        Perform one MH step using the chosen proposal coupling method (per Algorithm 3.4).
+        
         Args:
-            current_state: A tuple (state1, state2) where each tensor has shape [batch, d].
-            previous_kernel_results: A dict from the previous iteration; must include "t" (iteration counter)
-                                     and "meeting_time" (an int32 tensor of shape [batch]).
+            current_state: Tuple (X, Y), each of shape [batch, d].
+            previous_kernel_results: Dict containing:
+                 "t": iteration counter (int32 scalar tensor)
+                 "meeting_time": int32 tensor of shape [batch] recording meeting time (initialized as -1 if not met)
+        
         Returns:
-            new_state: A tuple (new_state1, new_state2).
-            new_kernel_results: A dict with updated kernel results.
+            new_state: Tuple (new_X, new_Y).
+            new_kernel_results: Updated kernel results (including meeting time and other quantities).
         """
         with tf.name_scope(self._name + ".one_step"):
             # Unpack current state
-            state1, state2 = current_state
-            current_log_prob1 = self._target_log_prob_fn(state1)
-            current_log_prob2 = self._target_log_prob_fn(state2)
-
-            # Determine dimension and batch size (assumed static)
-            stat_shape = state1.shape.as_list()
-            if stat_shape[-1] is None or stat_shape[0] is None:
+            X, Y = current_state
+            logp_X = self._target_log_prob_fn(X)
+            logp_Y = self._target_log_prob_fn(Y)
+            
+            # Get static shape info
+            X_shape = X.shape.as_list()
+            if X_shape[0] is None or X_shape[-1] is None:
                 raise ValueError("Batch and event dimensions must be statically known.")
-            d = stat_shape[-1]
-            batch_size = stat_shape[0]
+            batch_size = X_shape[0]
+            d = X_shape[-1]
+            tol = tf.cast(1e-5, X.dtype)
 
-            # Compute proposal standard deviation
-            scale = tf.sqrt(tf.cast(self._proposal_var, state1.dtype))
+            # Create proposal distributions: Gaussian proposals N(state, proposal_var * I)
+            scale = tf.sqrt(tf.cast(self._proposal_var, X.dtype))
             scale_diag = tf.fill([d], scale)
-            proposal_d1 = tfd.MultivariateNormalDiag(loc=state1, scale_diag=scale_diag)
-            proposal_d2 = tfd.MultivariateNormalDiag(loc=state2, scale_diag=scale_diag)
+            proposal_dist_X = tfd.MultivariateNormalDiag(loc=X, scale_diag=scale_diag)
+            proposal_dist_Y = tfd.MultivariateNormalDiag(loc=Y, scale_diag=scale_diag)
 
-            # Generate candidate proposals using the chosen coupling method.
+            # Coupled proposal sampling using the chosen method
             if self._coupling_method == "maximal":
-                candidate1, candidate2 = maximal_coupling(
-                    proposal_d1, proposal_d2, batch_shape=(batch_size,), max_iter=self._max_iter)
+                candidate_X, candidate_Y = maximal_coupling(
+                    proposal_dist_X, proposal_dist_Y,
+                    batch_shape=(batch_size,),
+                    max_iter=self._max_iter)
             elif self._coupling_method == "maximal_reflection":
-                # For maximal reflection, build a batch of covariance matrices.
-                cov_matrix = tf.eye(d, dtype=state1.dtype) * self._proposal_var
+                cov_matrix = tf.eye(d, dtype=X.dtype) * self._proposal_var
                 cov = tf.tile(tf.expand_dims(cov_matrix, axis=0), [batch_size, 1, 1])
-                candidate1, candidate2 = maximal_reflection_coupling_normal(state1, state2, cov)
+                candidate_X, candidate_Y = maximal_reflection_coupling_normal(X, Y, cov)
             else:
                 raise ValueError("Unknown coupling_method: {}".format(self._coupling_method))
-
-            # Compute candidate log densities.
-            candidate_log_prob1 = self._target_log_prob_fn(candidate1)
-            candidate_log_prob2 = self._target_log_prob_fn(candidate2)
-
-            # Compute log acceptance ratios (symmetric proposal).
-            log_alpha1 = candidate_log_prob1 - current_log_prob1
-            log_alpha2 = candidate_log_prob2 - current_log_prob2
-
-            # Determine if the candidate proposals are coupled (approximately equal).
-            tol = tf.cast(1e-5, state1.dtype)
-            coupled = tf.reduce_all(tf.abs(candidate1 - candidate2) < tol, axis=-1)  # shape [batch]
-
-            # Use common random numbers for coupled cases.
-            u_common = tf.random.uniform([batch_size], dtype=state1.dtype, seed=self._seed_stream())
-            u1 = tf.where(coupled,
-                          u_common,
-                          tf.random.uniform([batch_size], dtype=state1.dtype, seed=self._seed_stream()))
-            u2 = tf.where(coupled,
-                          u_common,
-                          tf.random.uniform([batch_size], dtype=state1.dtype, seed=self._seed_stream()))
-
-            # MH acceptance: accept if log(u) < min(0, log_alpha)
-            accept1 = tf.math.log(u1) < tf.minimum(0.0, log_alpha1)
-            accept2 = tf.math.log(u2) < tf.minimum(0.0, log_alpha2)
-
-            new_state1 = tf.where(tf.expand_dims(accept1, -1), candidate1, state1)
-            new_state2 = tf.where(tf.expand_dims(accept2, -1), candidate2, state2)
-
-            # Update iteration counter.
+            
+            # Evaluate proposal densities at the candidate states
+            density_X = proposal_dist_X.prob(candidate_X)
+            density_Y = proposal_dist_Y.prob(candidate_Y)
+            
+            # Compute candidate target log probabilities
+            cand_logp_X = self._target_log_prob_fn(candidate_X)
+            cand_logp_Y = self._target_log_prob_fn(candidate_Y)
+            
+            # Compute standard MH acceptance probabilities (symmetry assumed)
+            a_X = tf.minimum(tf.ones([batch_size], dtype=X.dtype), tf.exp(cand_logp_X - logp_X))
+            a_Y = tf.minimum(tf.ones([batch_size], dtype=X.dtype), tf.exp(cand_logp_Y - logp_Y))
+            
+            # f-values: f = proposal density × acceptance probability
+            f_X = density_X * a_X
+            f_Y = density_Y * a_Y
+            
+            # Compute the diagonal proposal density (pointwise minimum of densities)
+            qm = tf.minimum(density_X, density_Y)
+            
+            # For candidate proposals being equal, compute b-values:
+            b_XY = tf.where(qm > 0,
+                            tf.minimum(tf.ones([batch_size], dtype=X.dtype), f_X / qm),
+                            tf.ones([batch_size], dtype=X.dtype))
+            b_YX = tf.where(qm > 0,
+                            tf.minimum(tf.ones([batch_size], dtype=X.dtype), f_Y / qm),
+                            tf.ones([batch_size], dtype=X.dtype))
+            
+            # For non-coupled proposals, compute residual ratios
+            f_r_X = tf.maximum(f_X - qm, 0.0)
+            q_r_X = tf.maximum(density_X - qm, 0.0)
+            c_XY = tf.where(q_r_X > 0, f_r_X / q_r_X, tf.ones([batch_size], dtype=X.dtype))
+            
+            f_r_Y = tf.maximum(f_Y - qm, 0.0)
+            q_r_Y = tf.maximum(density_Y - qm, 0.0)
+            c_YX = tf.where(q_r_Y > 0, f_r_Y / q_r_Y, tf.ones([batch_size], dtype=X.dtype))
+            
+            # Determine whether the candidate proposals are equal (coupled)
+            coupled_flag = tf.reduce_all(tf.abs(candidate_X - candidate_Y) < tol, axis=-1)  # shape [batch]
+            
+            # Generate random numbers for acceptance decisions
+            u_common = tf.random.uniform([batch_size], dtype=X.dtype, seed=self._seed_stream())
+            u_indep_X = tf.random.uniform([batch_size], dtype=X.dtype, seed=self._seed_stream())
+            u_indep_Y = tf.random.uniform([batch_size], dtype=X.dtype, seed=self._seed_stream())
+            
+            # If coupled, use the common uniform; else use independent uniforms.
+            accept_X = tf.where(coupled_flag, u_common < b_XY, u_indep_X < c_XY)
+            accept_Y = tf.where(coupled_flag, u_common < b_YX, u_indep_Y < c_YX)
+            
+            # Update state: if accepted, move to candidate; otherwise remain at current state.
+            new_X = tf.where(tf.expand_dims(accept_X, axis=-1), candidate_X, X)
+            new_Y = tf.where(tf.expand_dims(accept_Y, axis=-1), candidate_Y, Y)
+            
+            # Update iteration counter and record meeting time (if new_X and new_Y are sufficiently close)
             current_t = previous_kernel_results["t"]
             new_t = current_t + 1
-
-            # Update meeting time: if chains are coupled (for batches not yet met), record meeting time.
             old_meeting_time = previous_kernel_results["meeting_time"]  # shape [batch]
-            met_now = tf.reduce_all(tf.abs(new_state1 - new_state2) < tol, axis=1)
+            met_now = tf.reduce_all(tf.abs(new_X - new_Y) < tol, axis=1)
             new_meeting_time = tf.where(tf.logical_and(tf.equal(old_meeting_time, -1), met_now),
                                         new_t,
                                         old_meeting_time)
-
+            
             new_kernel_results = {
-                "target_log_prob": (tf.where(accept1, candidate_log_prob1, current_log_prob1),
-                                    tf.where(accept2, candidate_log_prob2, current_log_prob2)),
-                "accepted": (accept1, accept2),
-                "proposals": (candidate1, candidate2),
-                "current_log_prob": (current_log_prob1, current_log_prob2),
+                "target_log_prob": (tf.where(accept_X, cand_logp_X, logp_X),
+                                    tf.where(accept_Y, cand_logp_Y, logp_Y)),
+                "accepted": (accept_X, accept_Y),
+                "proposals": (candidate_X, candidate_Y),
+                "current_log_prob": (logp_X, logp_Y),
                 "t": new_t,
                 "meeting_time": new_meeting_time
             }
-            new_state = (new_state1, new_state2)
+            new_state = (new_X, new_Y)
             return new_state, new_kernel_results
 
     def bootstrap_results(self, current_state):
         """
-        Initialize the kernel results.
-        Fields: "t" is the iteration counter and "meeting_time" is set to 0 for coupled chains
-        and -1 otherwise.
+        Initialize kernel results.
         """
-        state1, state2 = current_state
-        current_log_prob1 = self._target_log_prob_fn(state1)
-        current_log_prob2 = self._target_log_prob_fn(state2)
-        tol = tf.cast(1e-5, state1.dtype)
-        met_initial = tf.reduce_all(tf.abs(state1 - state2) < tol, axis=1)
-        batch_size = tf.shape(state1)[0]
+        X, Y = current_state
+        logp_X = self._target_log_prob_fn(X)
+        logp_Y = self._target_log_prob_fn(Y)
+        tol = tf.cast(1e-5, X.dtype)
+        met_initial = tf.reduce_all(tf.abs(X - Y) < tol, axis=1)
+        batch_size = tf.shape(X)[0]
         meeting_time = tf.where(met_initial,
                                 tf.zeros([batch_size], dtype=tf.int32),
                                 -tf.ones([batch_size], dtype=tf.int32))
         return {
-            "target_log_prob": (current_log_prob1, current_log_prob2),
-            "accepted": (tf.zeros(tf.shape(current_log_prob1), dtype=tf.bool),
-                         tf.zeros(tf.shape(current_log_prob2), dtype=tf.bool)),
-            "proposals": (tf.zeros_like(state1), tf.zeros_like(state2)),
-            "current_log_prob": (current_log_prob1, current_log_prob2),
+            "target_log_prob": (logp_X, logp_Y),
+            "accepted": (tf.zeros(tf.shape(logp_X), dtype=tf.bool),
+                         tf.zeros(tf.shape(logp_Y), dtype=tf.bool)),
+            "proposals": (tf.zeros_like(X), tf.zeros_like(Y)),
+            "current_log_prob": (logp_X, logp_Y),
             "t": tf.constant(0, dtype=tf.int32),
             "meeting_time": meeting_time
         }
+
+# Helper function: use tfp.mcmc.sample_chain to run the coupled chain and save samples in TFP format.
+def sample_coupled_chain(initial_state, kernel, num_results, num_burnin_steps=0):
+    """
+    Run the coupled chain using tfp.mcmc.sample_chain.
+    
+    Args:
+        initial_state: Tuple (X, Y) with shape [batch, d].
+        kernel: An instance of CoupledMetropolisHastingsKernel.
+        num_results: Number of iterations to sample.
+        num_burnin_steps: Number of burn-in steps.
+        
+    Returns:
+        A tuple containing:
+          - chain_samples: Tuple (chain_X, chain_Y) with shape [num_results, batch, d].
+          - kernel_results: Trace information as returned by trace_fn.
+    """
+    sample_chain_results = tfp.mcmc.sample_chain(
+        num_results=num_results,
+        current_state=initial_state,
+        kernel=kernel,
+        num_burnin_steps=num_burnin_steps,
+        trace_fn=lambda current_state, kernel_results: kernel_results,
+        seed=kernel._seed_stream())
+    return sample_chain_results
