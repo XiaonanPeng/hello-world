@@ -32,103 +32,184 @@ from coupled_mh_kernel import CoupledMetropolisHastingsKernel  # This is our cou
 
 tfd = tfp.distributions
 
-def leapfrog_integrator(q, p, step_size, target_log_prob_fn):
-    """
-    Performs one step of the leapfrog integration.
 
+def efficient_leapfrog_trajectory(q0, p0, num_steps, step_size, target_log_prob_fn):
+    """
+    Efficient leapfrog integrator that computes gradients only L+1 times for a trajectory of length L+1.
+    
     Args:
-        q: Tensor of shape [batch, d] for positions.
-        p: Tensor of shape [batch, d] for momenta.
-        step_size: A float integration step size.
-        target_log_prob_fn: A callable mapping [batch, d] to log probability.
-
+      q0: Initial position tensor of shape [d]
+      p0: Initial momentum tensor of shape [d]
+      num_steps: Number of leapfrog steps (integer scalar)
+      step_size: Integration step size.
+      target_log_prob_fn: Function that computes log probability.
+        (Expects input shape [1, d])
+      
     Returns:
-        A tuple (q_new, p_new) with updated positions and momenta.
+      traj_q: Tensor of positions with shape [num_steps+1, d]
+      traj_p: Tensor of momenta with shape [num_steps+1, d]
+      traj_logp: Tensor of log probabilities, shape [num_steps+1]
     """
+    d = tf.shape(q0)[0]
+    
+    # Initialize TensorArrays for trajectory storage.
+    TA_q = tf.TensorArray(dtype=q0.dtype, size=num_steps+1)
+    TA_p = tf.TensorArray(dtype=p0.dtype, size=num_steps+1)
+    TA_logp = tf.TensorArray(dtype=q0.dtype, size=num_steps+1)
+    
+    # Evaluate initial log probability and gradient at q0.
+    q0_exp = tf.expand_dims(q0, axis=0)
     with tf.GradientTape() as tape:
-        tape.watch(q)
-        logp = target_log_prob_fn(q)
-    grad_U = -tape.gradient(logp, q)
-    p_half = p - 0.5 * step_size * grad_U
-    q_new = q + step_size * p_half
-    with tf.GradientTape() as tape:
-        tape.watch(q_new)
-        logp_new = target_log_prob_fn(q_new)
-    grad_U_new = -tape.gradient(logp_new, q_new)
-    p_new = p_half - 0.5 * step_size * grad_U_new
-    return q_new, p_new
+        tape.watch(q0)
+        logp0 = target_log_prob_fn(q0_exp)[0]
+    grad_U = -tape.gradient(logp0, q0)
+    
+    # Initial half-step update for momentum.
+    p_half = p0 - 0.5 * step_size * grad_U
+    
+    # Write the initial state (q0, p_half, logp0).
+    TA_q = TA_q.write(0, q0)
+    TA_p = TA_p.write(0, p_half)
+    TA_logp = TA_logp.write(0, logp0)
+    
+    # Set current state for the loop: note that we already updated p with a half-step.
+    q_current = q0
+    p_current = p_half
+    
+    i = tf.constant(0, dtype=tf.int32)
+    
+    def cond(i, q, p, TA_q, TA_p, TA_logp):
+        return tf.less(i, num_steps)
+    
+    def body(i, q, p, TA_q, TA_p, TA_logp):
+        # Full step for position: q <- q + step_size * p.
+        q_new = q + step_size * p
+        q_new_exp = tf.expand_dims(q_new, axis=0)
+        # Compute new log probability and gradient at q_new.
+        with tf.GradientTape() as tape:
+            tape.watch(q_new)
+            logp_new = target_log_prob_fn(q_new_exp)[0]
+        grad_U_new = -tape.gradient(logp_new, q_new)
+        # Update momentum:
+        # For intermediate steps use a full step; for final step use a half-step update.
+        p_new = tf.cond(
+            tf.less(i, num_steps - 1),
+            lambda: p - step_size * grad_U_new,
+            lambda: p - 0.5 * step_size * grad_U_new
+        )
+        # Write the new state into TensorArrays.
+        TA_q = TA_q.write(i+1, q_new)
+        TA_p = TA_p.write(i+1, p_new)
+        TA_logp = TA_logp.write(i+1, logp_new)
+        return i+1, q_new, p_new, TA_q, TA_p, TA_logp
+    
+    # Run the while loop for num_steps iterations.
+    _, _, _, TA_q_final, TA_p_final, TA_logp_final = tf.while_loop(
+        cond,
+        body,
+        loop_vars=(i, q_current, p_current, TA_q, TA_p, TA_logp)
+    )
+    
+    traj_q = TA_q_final.stack()      # Shape: [num_steps+1, d]
+    traj_p = TA_p_final.stack()      # Shape: [num_steps+1, d]
+    traj_logp = TA_logp_final.stack()  # Shape: [num_steps+1]
+    
+    return traj_q, traj_p, traj_logp
 
-def simulate_trajectory(q0, p0, L, step_size, target_log_prob_fn):
+def simulate_direction(q0, p0, num_steps, step_size, target_log_prob_fn):
     """
-    Simulates a full trajectory for multinomial HMC.
-
-    Procedure:
-      1. Sample L_f uniformly in {0, 1, ..., L} as the number of forward steps.
-         Let L_b = L - L_f be the number of backward steps.
-      2. Perform forward integration starting from (q0, p0) for L_f steps.
-      3. Perform backward integration starting from (q0, -p0) for L_b steps.
-      4. Reverse the backward trajectory (excluding the starting state) and concatenate it with the forward trajectory.
-         This forms a complete trajectory of length L+1.
-
+    Simulate a trajectory for one sample in one integration direction using efficient leapfrog.
+    
     Args:
-        q0: Tensor of shape [batch, d] for the initial positions.
-        p0: Tensor of shape [batch, d] for the initial momenta.
-        L: Integer, maximum number of leapfrog steps.
-        step_size: Float step size.
-        target_log_prob_fn: Callable mapping [batch, d] -> log probability.
-
+      q0: Initial position tensor [d]
+      p0: Initial momentum tensor [d]
+      num_steps: Number of leapfrog steps (integer scalar)
+      step_size: Integration step size.
+      target_log_prob_fn: Function to compute log probability.
+      
     Returns:
-        A tuple (traj_q, traj_p) where:
-          - traj_q is a tensor of shape [L+1, batch, d] containing the trajectory positions.
-          - traj_p is a tensor of shape [L+1, batch, d] containing the trajectory momenta.
+      traj_q: Tensor of positions with shape [num_steps+1, d]
+      traj_p: Tensor of momenta with shape [num_steps+1, d]
+      traj_logp: Tensor of log probabilities with shape [num_steps+1]
     """
-    batch = tf.shape(q0)[0]
-    d = tf.shape(q0)[1]
-    # Sample number of forward steps uniformly from {0,1,...,L}
-    L_f = tf.random.uniform([], minval=0, maxval=L+1, dtype=tf.int32)
-    L_b = L - L_f
+    def no_step():
+        # If no steps are taken, simply return the initial state.
+        q0_exp = tf.expand_dims(q0, axis=0)
+        logp0 = tf.stop_gradient(target_log_prob_fn(q0_exp))[0]
+        return tf.expand_dims(q0, axis=0), tf.expand_dims(p0, axis=0), tf.expand_dims(logp0, axis=0)
+    
+    traj_q, traj_p, traj_logp = tf.cond(
+        tf.equal(num_steps, 0),
+        no_step,
+        lambda: efficient_leapfrog_trajectory(q0, p0, num_steps, step_size, target_log_prob_fn)
+    )
+    return traj_q, traj_p, traj_logp
 
-    # Forward integration (using positive momentum)
-    forward_q_array = tf.TensorArray(dtype=q0.dtype, size=L_f + 1)
-    forward_p_array = tf.TensorArray(dtype=p0.dtype, size=L_f + 1)
-    forward_q_array = forward_q_array.write(0, q0)
-    forward_p_array = forward_p_array.write(0, p0)
-    q_curr = q0
-    p_curr = p0
-    for i in tf.range(1, L_f + 1):
-        q_curr, p_curr = leapfrog_integrator(q_curr, p_curr, step_size, target_log_prob_fn)
-        forward_q_array = forward_q_array.write(i, q_curr)
-        forward_p_array = forward_p_array.write(i, p_curr)
-    forward_q = forward_q_array.stack()  # shape: [L_f+1, batch, d]
-    forward_p = forward_p_array.stack()    # shape: [L_f+1, batch, d]
+def simulate_trajectory(q0_batch, p0_batch, L, step_size, target_log_prob_fn):
+    """
+    Simulate trajectories for a batch of samples using dynamic forward/backward integration.
+    
+    For each sample:
+      - Randomly choose the number of forward integration steps (Lf) from {0,...,L}.
+      - Compute backward integration steps as Lb = L - Lf.
+      - Simulate forward trajectory using initial momentum p0.
+      - Simulate backward trajectory using negative momentum (-p0).
+      - Remove the duplicate initial state from the backward trajectory (if any),
+        reverse the backward trajectory, and concatenate it with the forward trajectory.
+        This guarantees a total trajectory length of L+1.
+        
+    Args:
+      q0_batch: Tensor of initial positions, shape [batch, d]
+      p0_batch: Tensor of initial momenta, shape [batch, d]
+      L: Integer scalar representing the upper bound for forward steps; total steps = L+1.
+      step_size: Integration step size.
+      target_log_prob_fn: Function to compute log probability.
+      
+    Returns:
+      traj_q_batch: Tensor of positions, shape [batch, L+1, d]
+      traj_p_batch: Tensor of momenta, shape [batch, L+1, d]
+      traj_logp_batch: Tensor of log probabilities, shape [batch, L+1]
+    """
+    def simulate_single(sample):
+        # Unpack the individual sample's initial state and momentum (both shape [d]).
+        q0, p0 = sample  
+        d = tf.shape(q0)[0]
+        # Randomly choose forward integration steps Lf from {0, 1, ..., L}.
+        Lf = tf.random.uniform(shape=[], minval=0, maxval=L+1, dtype=tf.int32)
+        # Backward integration steps Lb = L - Lf.
+        Lb = L - Lf
+        
+        # Simulate forward trajectory with positive momentum p0.
+        forward_q, forward_p, forward_logp = simulate_direction(q0, p0, Lf, step_size, target_log_prob_fn)
+        # Simulate backward trajectory with negative momentum -p0.
+        backward_q, backward_p, backward_logp = simulate_direction(q0, -p0, Lb, step_size, target_log_prob_fn)
+        
+        # Remove duplicate initial state from the backward trajectory (if any) and reverse its order.
+        def get_backward():
+            return (tf.reverse(backward_q[1:], axis=[0]),
+                    tf.reverse(backward_p[1:], axis=[0]),
+                    tf.reverse(backward_logp[1:], axis=[0]))
+        
+        q_back, p_back, logp_back = tf.cond(tf.equal(Lb, 0),
+                                            lambda: (tf.zeros([0, d], dtype=q0.dtype),
+                                                     tf.zeros([0, d], dtype=p0.dtype),
+                                                     tf.zeros([0], dtype=forward_logp.dtype)),
+                                            get_backward)
+        
+        # Concatenate backward (reversed) trajectory with forward trajectory.
+        traj_q = tf.concat([q_back, forward_q], axis=0)         # Shape: [L+1, d]
+        traj_p = tf.concat([p_back, forward_p], axis=0)         # Shape: [L+1, d]
+        traj_logp = tf.concat([logp_back, forward_logp], axis=0)  # Shape: [L+1]
+        return traj_q, traj_p, traj_logp
 
-    # Backward integration (using negative momentum)
-    backward_q_array = tf.TensorArray(dtype=q0.dtype, size=L_b + 1)
-    backward_p_array = tf.TensorArray(dtype=p0.dtype, size=L_b + 1)
-    backward_q_array = backward_q_array.write(0, q0)
-    backward_p_array = backward_p_array.write(0, -p0)
-    q_curr_b = q0
-    p_curr_b = -p0
-    for i in tf.range(1, L_b + 1):
-        q_curr_b, p_curr_b = leapfrog_integrator(q_curr_b, p_curr_b, step_size, target_log_prob_fn)
-        backward_q_array = backward_q_array.write(i, q_curr_b)
-        backward_p_array = backward_p_array.write(i, p_curr_b)
-    backward_q = backward_q_array.stack()  # shape: [L_b+1, batch, d]
-    backward_p = backward_p_array.stack()    # shape: [L_b+1, batch, d]
-
-    # Reverse the backward trajectory (excluding the duplicate initial state q0)
-    if L_b > 0:
-        backward_q_ex = backward_q[1:]  # shape: [L_b, batch, d]
-        backward_p_ex = backward_p[1:]
-        backward_q_rev = tf.reverse(backward_q_ex, axis=[0])
-        backward_p_rev = tf.reverse(backward_p_ex, axis=[0])
-    else:
-        backward_q_rev = tf.zeros([0, batch, d], dtype=q0.dtype)
-        backward_p_rev = tf.zeros([0, batch, d], dtype=p0.dtype)
-    # Concatenate backward (reversed) with forward trajectory to form full trajectory of length L+1.
-    traj_q = tf.concat([backward_q_rev, forward_q], axis=0)
-    traj_p = tf.concat([backward_p_rev, forward_p], axis=0)
-    return traj_q, traj_p
+    # Process each sample in the batch via tf.map_fn.
+    traj_q_batch, traj_p_batch, traj_logp_batch = tf.map_fn(
+        simulate_single,
+        (q0_batch, p0_batch),
+        dtype=(q0_batch.dtype, p0_batch.dtype, tf.float32)
+    )
+    
+    return traj_q_batch, traj_p_batch, traj_logp_batch
 
 class UnbiasedMultinomialHMC(tfp.mcmc.TransitionKernel):
     """
@@ -260,21 +341,15 @@ class UnbiasedMultinomialHMC(tfp.mcmc.TransitionKernel):
             batch = tf.shape(X)[0]
             # Sample shared momentum for both chains.
             p = self._momentum_distribution.sample(sample_shape=[batch], seed=coin_seed)
-            traj_X, traj_PX = simulate_trajectory(X, p, self._L, self._step_size, self._target_log_prob_fn)
-            traj_Y, traj_PY = simulate_trajectory(Y, p, self._L, self._step_size, self._target_log_prob_fn)
+            # Simulate trajectories. Each trajectory has shape [Batch, L+1, d], logp is [Batch, L+1]
+            traj_X, traj_PX, traj_logpX = simulate_trajectory(X, p, self._L, self._step_size, self._target_log_prob_fn)
+            traj_Y, traj_PY, traj_logpY = simulate_trajectory(Y, p, self._L, self._step_size, self._target_log_prob_fn)
             T = tf.shape(traj_X)[0]  # T = self._L + 1
-            # Compute log probabilities along the trajectory.
-            flat_traj_X = tf.reshape(traj_X, [T * batch, -1])
-            flat_traj_Y = tf.reshape(traj_Y, [T * batch, -1])
-            logp_X_all = self._target_log_prob_fn(flat_traj_X)
-            logp_Y_all = self._target_log_prob_fn(flat_traj_Y)
-            logp_X_all = tf.reshape(logp_X_all, [T, batch])
-            logp_Y_all = tf.reshape(logp_Y_all, [T, batch])
             # Compute kinetic energies as 0.5 * ||p||^2 at each trajectory point.
             kinetic_X = 0.5 * tf.reduce_sum(tf.square(traj_PX), axis=-1)
             kinetic_Y = 0.5 * tf.reduce_sum(tf.square(traj_PY), axis=-1)
-            energy_X = -logp_X_all + kinetic_X  # Shape [T, batch]
-            energy_Y = -logp_Y_all + kinetic_Y
+            energy_X = -traj_logpX + kinetic_X  # Shape [T, batch]
+            energy_Y = -traj_logpY + kinetic_Y
             weights_X = tf.exp(-energy_X)
             weights_Y = tf.exp(-energy_Y)
             # Normalize weights along the trajectory dimension for each batch element.
